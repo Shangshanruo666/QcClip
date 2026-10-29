@@ -778,7 +778,7 @@ impl TagManager {
         }
         let body = if self.loading {
             manager_status(translator.translate("main.tags.manager.loading"), theme)
-        } else if self.tags.is_empty() {
+        } else if self.tags.is_empty() && self.new_tag.is_none() {
             manager_status(translator.translate("main.tags.manager.empty"), theme)
         } else if visible_tags.is_empty() && self.new_tag.is_none() {
             manager_status(

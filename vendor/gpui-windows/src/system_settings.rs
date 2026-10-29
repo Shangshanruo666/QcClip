@@ -5,8 +5,9 @@ use std::{
 
 use gpui_util::ResultExt;
 use windows::Win32::UI::WindowsAndMessaging::{
-    SPI_GETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_ACTION,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    SPI_GETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLLINES, SPI_SETWHEELSCROLLCHARS,
+    SPI_SETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SystemParametersInfoW,
 };
 
 /// Windows settings pulled from SystemParametersInfo
@@ -37,7 +38,8 @@ impl WindowsSystemSettings {
 
     pub(crate) fn update(&self, wparam: usize) {
         match SYSTEM_PARAMETERS_INFO_ACTION(wparam as u32) {
-            SPI_GETWHEELSCROLLLINES | SPI_GETWHEELSCROLLCHARS => self.update_mouse_wheel_settings(),
+            // WM_SETTINGCHANGE 的 wParam 是触发变更的 SPI_SET* 动作，不是 SPI_GET*。
+            SPI_SETWHEELSCROLLLINES | SPI_SETWHEELSCROLLCHARS => self.update_mouse_wheel_settings(),
             _ => {}
         }
     }

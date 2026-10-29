@@ -160,6 +160,55 @@ pub(crate) struct PersistedState {
     pub(crate) preview_window: PersistedPreviewWindowState,
     pub(crate) legacy_migration_prompt_dismissed: bool,
     pub(crate) software_rendering_warning_dismissed: bool,
+    /// 贴在屏幕上的便签，启动时按顺序恢复。
+    pub(crate) sticky_notes: Vec<PersistedStickyNote>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub(crate) struct PersistedStickyNote {
+    pub(crate) item_id: i64,
+    /// GPUI 全局逻辑坐标下的窗口外框。
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+    /// 用户选择的便签颜色（0xRRGGBB）；为空时跟随主题。
+    #[serde(deserialize_with = "deserialize_sticky_color")]
+    pub(crate) color: Option<u32>,
+    pub(crate) topmost: bool,
+    pub(crate) collapsed: bool,
+    pub(crate) opacity: f32,
+    pub(crate) split: bool,
+}
+
+impl Default for PersistedStickyNote {
+    fn default() -> Self {
+        Self {
+            item_id: 0,
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+            color: None,
+            topmost: true,
+            collapsed: false,
+            opacity: 1.0,
+            split: false,
+        }
+    }
+}
+
+/// 只接受 0xRRGGBB 数值；无法识别的旧值按跟随主题处理，不让整份状态读取失败。
+fn deserialize_sticky_color<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_u64()
+        .and_then(|color| u32::try_from(color).ok())
+        .filter(|color| *color <= 0xFF_FFFF))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -235,6 +284,7 @@ impl Default for PersistedState {
             preview_window: PersistedPreviewWindowState::default(),
             legacy_migration_prompt_dismissed: false,
             software_rendering_warning_dismissed: false,
+            sticky_notes: Vec::new(),
         }
     }
 }
@@ -357,6 +407,17 @@ pub(crate) fn set_last_search_engine_template(template: Option<String>, cx: &mut
     state.main_window.last_search_engine_template = template;
     if let Err(error) = set_state(state, cx) {
         tracing::error!("保存上次搜索引擎失败：{error}");
+    }
+}
+
+pub(crate) fn set_sticky_notes(notes: Vec<PersistedStickyNote>, cx: &mut App) {
+    let mut state = state(cx);
+    if state.sticky_notes == notes {
+        return;
+    }
+    state.sticky_notes = notes;
+    if let Err(error) = set_state(state, cx) {
+        tracing::error!("保存便签状态失败：{error}");
     }
 }
 
@@ -625,6 +686,20 @@ mod tests {
         let loaded = load_state(&path);
         assert_eq!(loaded, state);
         assert_eq!(loaded.preview_window.restored_image_base_size(), 720.0);
+    }
+
+    #[test]
+    fn sticky_note_color_accepts_custom_values_and_ignores_unknown_ones() {
+        let notes: Vec<super::PersistedStickyNote> = serde_json::from_str(
+            r#"[{"item_id":1,"color":3900150},{"item_id":2,"color":"Yellow"},{"item_id":3}]"#,
+        )
+        .expect("便签状态读取失败");
+        assert_eq!(notes[0].color, Some(0x3B82F6));
+        assert_eq!(notes[1].color, None);
+        assert_eq!(notes[2].color, None);
+        let json = serde_json::to_string(&notes[0]).unwrap();
+        let loaded: super::PersistedStickyNote = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.color, Some(0x3B82F6));
     }
 
     #[test]

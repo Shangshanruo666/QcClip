@@ -51,11 +51,12 @@ impl SettingsWindowView {
 
         let reset_error = translator.translate("settings.list_preview.reset_error");
         let reset_view = view.clone();
+        let reset_hover_preview_delay_slider = self.hover_preview_delay_slider.clone();
         let reset_button = Button::new("settings-list-preview-reset")
             .warning()
             .small()
             .label(translator.translate("settings.action.reset_page"))
-            .on_click(move |_, _, cx| {
+            .on_click(move |_, window, cx| {
                 // 本页字段分属剪贴板与外观两份配置，分别只恢复本页展示的部分。
                 let mut clipboard = config_runtime::clipboard_config(cx);
                 reset_list_preview_clipboard_fields(&mut clipboard);
@@ -67,6 +68,12 @@ impl SettingsWindowView {
                     tracing::error!("重置列表与预览设置失败：{error}");
                     reset_error.clone()
                 });
+                if result.is_ok() {
+                    let default_delay = f32::from(ClipboardConfig::HOVER_PREVIEW_DELAY_DEFAULT_MS);
+                    reset_hover_preview_delay_slider.update(cx, |slider, cx| {
+                        slider.set_value(default_delay, window, cx);
+                    });
+                }
                 reset_view.update(cx, |view, cx| {
                     view.appearance_error =
                         notify_settings_error(SettingsPage::ListPreview, error_message, cx);
@@ -282,6 +289,60 @@ impl SettingsWindowView {
                     );
                 }
             });
+        let mut preview_scale_presets = crate::config::UI_SCALE_PRESETS.to_vec();
+        if !preview_scale_presets.contains(&appearance.preview_scale_percent) {
+            preview_scale_presets.push(appearance.preview_scale_percent);
+            preview_scale_presets.sort_unstable();
+        }
+        let preview_scale_items = preview_scale_presets
+            .into_iter()
+            .map(|percent| {
+                DropdownItem::option(
+                    DropdownItemId::new(percent.to_string()),
+                    format!("{percent}%"),
+                )
+                .selected(percent == appearance.preview_scale_percent)
+            })
+            .collect::<Vec<_>>();
+        let preview_scale_selector = settings_dropdown(
+            "settings-preview-scale-select",
+            appearance.preview_scale_percent.to_string(),
+            preview_scale_items,
+            {
+                let view = view.clone();
+                let save_error = appearance_save_error.clone();
+                move |id, cx| {
+                    let Ok(percent) = id.as_str().parse::<u16>() else {
+                        return;
+                    };
+                    persist_appearance_change(
+                        view.clone(),
+                        "预览窗口缩放",
+                        move |appearance| appearance.preview_scale_percent = percent,
+                        save_error.clone(),
+                        cx,
+                    );
+                }
+            },
+            cx,
+        );
+        let hover_preview_delay_selector = h_flex()
+            .w(ui_rem(SETTINGS_LINE_HEIGHT_SELECTOR_WIDTH))
+            .gap_3()
+            .when(!clipboard.hover_preview_enabled, |this| this.opacity(0.5))
+            .child(
+                Slider::new(&self.hover_preview_delay_slider)
+                    .disabled(!clipboard.hover_preview_enabled)
+                    .flex_1(),
+            )
+            .child(
+                div()
+                    .w(ui_rem(62.0))
+                    .text_sm()
+                    .text_right()
+                    .text_color(theme.foreground)
+                    .child(format!("{} ms", clipboard.hover_preview_delay_ms)),
+            );
         let heat_scrollbar_switch = Switch::new("settings-clipboard-heat-scrollbar")
             .large()
             .checked(clipboard.heat_scrollbar_enabled)
@@ -455,6 +516,30 @@ impl SettingsWindowView {
                 ),
             )
             .child(
+                self.setting_row(
+                    theme,
+                    translator.translate("settings.clipboard.hover_preview_delay"),
+                    Some(
+                        translator
+                            .translate("settings.clipboard.hover_preview_delay_description")
+                            .into(),
+                    ),
+                    hover_preview_delay_selector,
+                ),
+            )
+            .child(
+                self.setting_row(
+                    theme,
+                    translator.translate("settings.personalization.preview_scale"),
+                    Some(
+                        translator
+                            .translate("settings.personalization.preview_scale_description")
+                            .into(),
+                    ),
+                    preview_scale_selector,
+                ),
+            )
+            .child(
                 self.highlight_element(
                     theme,
                     translator.translate("settings.clipboard.preview_types"),
@@ -518,6 +603,7 @@ fn reset_list_preview_clipboard_fields(clipboard: &mut ClipboardConfig) {
     clipboard.display_priority = default.display_priority;
     clipboard.heat_scrollbar_enabled = default.heat_scrollbar_enabled;
     clipboard.hover_preview_enabled = default.hover_preview_enabled;
+    clipboard.hover_preview_delay_ms = default.hover_preview_delay_ms;
     clipboard.preview_types = default.preview_types;
     clipboard.preview_priority = default.preview_priority;
 }
@@ -535,6 +621,7 @@ fn reset_list_preview_appearance_fields(appearance: &mut AppearanceConfig) {
     appearance.pasted_item_border = default.pasted_item_border;
     appearance.gallery_gif_autoplay = default.gallery_gif_autoplay;
     appearance.preview_information = default.preview_information;
+    appearance.preview_scale_percent = default.preview_scale_percent;
 }
 
 fn open_preview_types_sheet(

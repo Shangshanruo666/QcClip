@@ -9,6 +9,7 @@ use crate::{
 const TOGGLE_MAIN_WINDOW_ACTION: &str = "tray.toggle-main-window";
 const TOGGLE_CLIPBOARD_MONITOR_ACTION: &str = "tray.toggle-clipboard-monitor";
 const TOGGLE_GLOBAL_HOTKEYS_ACTION: &str = "tray.toggle-global-hotkeys";
+const TOGGLE_FORMATTED_PASTE_ACTION: &str = "tray.toggle-formatted-paste";
 const SETTINGS_ACTION: &str = "tray.settings";
 const RESTART_ACTION: &str = "tray.restart";
 const QUIT_ACTION: &str = "tray.quit";
@@ -156,6 +157,17 @@ fn open_menu(position: MenuPosition, cx: &mut App) {
             }),
         )
         .with_icon(MenuIcon::svg("keyboard.svg")),
+        MenuItem::action(
+            MenuActionId::new(TOGGLE_FORMATTED_PASTE_ACTION),
+            translator.translate(
+                if crate::config_runtime::clipboard_config(cx).formatted_paste {
+                    "tray.menu.formatted_paste.enabled"
+                } else {
+                    "tray.menu.formatted_paste.disabled"
+                },
+            ),
+        )
+        .with_icon(MenuIcon::svg("typography.svg")),
         MenuItem::separator(),
         MenuItem::action(
             MenuActionId::new(SETTINGS_ACTION),
@@ -278,6 +290,7 @@ fn handle_menu_action(action: MenuActionId, cx: &mut App) {
                 cx,
             );
         }
+        TOGGLE_FORMATTED_PASTE_ACTION => toggle_formatted_paste(cx),
         SETTINGS_ACTION => crate::windows::settings::open_settings_window(cx),
         CHECK_UPDATES_ACTION => crate::services::updates::UpdateService::check(true, cx),
         OPEN_RELEASE_ACTION => crate::windows::settings::open_about_window(cx),
@@ -285,4 +298,40 @@ fn handle_menu_action(action: MenuActionId, cx: &mut App) {
         QUIT_ACTION => cx.quit(),
         _ => {}
     }
+}
+
+pub(crate) fn toggle_formatted_paste(cx: &mut App) {
+    use crate::windows::notification::{NotificationLevel, NotificationService};
+    let mut clipboard = crate::config_runtime::clipboard_config(cx);
+    let enabled = !clipboard.formatted_paste;
+    clipboard.formatted_paste = enabled;
+    let result = crate::config_runtime::set_clipboard_config(clipboard, cx);
+    let translator = i18n::translator(cx);
+    let (title_key, detail, level) = match result {
+        Ok(_) if enabled => (
+            "notification.formatted_paste.enabled.title",
+            translator.translate("notification.formatted_paste.enabled.detail"),
+            NotificationLevel::Success,
+        ),
+        Ok(_) => (
+            "notification.formatted_paste.disabled.title",
+            translator.translate("notification.formatted_paste.disabled.detail"),
+            NotificationLevel::Info,
+        ),
+        Err(error) => {
+            tracing::error!("保存全局格式粘贴设置失败：{error}");
+            (
+                "notification.formatted_paste.failed.title",
+                error.to_string(),
+                NotificationLevel::Error,
+            )
+        }
+    };
+    NotificationService::show_message_for(
+        crate::config::NotificationKind::FeatureStatus,
+        translator.translate(title_key),
+        detail,
+        level,
+        cx,
+    );
 }

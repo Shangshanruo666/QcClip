@@ -21,6 +21,7 @@ use gpui::{
 use crate::{
     config::SessionShortcutId,
     config_runtime,
+    domain::clipboard::{ClipboardItemId, HistoryItemId},
     platform::{input, window as platform_window},
 };
 
@@ -165,6 +166,27 @@ impl MainWindowService {
             .and_then(|service| service.main_view.clone());
         if let Some(main_view) = main_view {
             main_view.update(cx, |view, cx| view.refresh_history(cx));
+        }
+    }
+
+    /// 保存复用列表增量更新，按数据库顺序同步内容和收藏关系。
+    pub(crate) fn refresh_saved_item(cx: &mut App, item_id: ClipboardItemId) {
+        let main_view = cx
+            .try_global::<Self>()
+            .and_then(|service| service.main_view.clone());
+        if let Some(main_view) = main_view {
+            main_view.update(cx, |view, cx| view.refresh_saved_item(item_id, cx));
+        }
+    }
+
+    pub(crate) fn refresh_captured_history_item(cx: &mut App, history_id: HistoryItemId) {
+        let main_view = cx
+            .try_global::<Self>()
+            .and_then(|service| service.main_view.clone());
+        if let Some(main_view) = main_view {
+            main_view.update(cx, |view, cx| {
+                view.refresh_captured_history_item(history_id, cx)
+            });
         }
     }
 
@@ -736,10 +758,22 @@ pub fn hide_main_window(cx: &mut App) {
 
 /// 主窗口发起粘贴前的统一准备：未固定时隐藏主窗口（固定时保持显示），
 /// 再把焦点交还给进入主窗口前的目标窗口。`action` 用于日志，如“列表粘贴”。
+/// 只恢复主窗口自身输入框的焦点会话；便签等其他窗口的输入框持有焦点时粘贴到该输入框。
 pub(crate) fn prepare_paste_target(action: &str, cx: &mut App) {
     hide_main_window(cx);
-    if let Err(error) = crate::services::focus::restore_previous_focus() {
+    let restored = MainWindowService::window_handle(cx).map(|window| {
+        window
+            .update(cx, |_, window, _| {
+                crate::services::focus::restore_previous_focus_for(window)
+            })
+            .map_err(|error| error.to_string())
+            .flatten()
+    });
+    if let Some(Err(error)) = restored {
         tracing::error!("{action}前恢复窗口焦点失败：{error}");
+    }
+    if let Err(error) = crate::services::focus::ensure_external_paste_target() {
+        tracing::error!("{action}前交还前台窗口失败：{error}");
     }
 }
 
@@ -804,6 +838,8 @@ pub(crate) fn dispatch_session_shortcut(id: SessionShortcutId, cx: &mut App) {
             SessionShortcutId::ExecutePaste => main.paste_selected_item(cx),
             SessionShortcutId::ToggleFavorite => main.toggle_selected_favorite(cx),
             SessionShortcutId::TogglePinned => main.toggle_selected_pinned(cx),
+            SessionShortcutId::PinToScreen => main.pin_selected_to_screen(false, cx),
+            SessionShortcutId::SplitWords => main.pin_selected_to_screen(true, cx),
             SessionShortcutId::DeleteItem => main.delete_selected_item(cx),
             SessionShortcutId::HideWindow => {}
         });

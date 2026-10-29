@@ -36,6 +36,13 @@ pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 9;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+/// SPI_GETWHEELSCROLLLINES 在“一次滚动一个屏幕”时返回的值。
+const WHEEL_PAGESCROLL: u32 = u32::MAX;
+/// 滚轮每行对应的逻辑像素，与 Chromium 一致（默认 3 行即每格 100px），不随字体行高变化。
+const WHEEL_PIXELS_PER_LINE: f32 = 100.0 / 3.0;
+/// 翻页时至少保留可视区的比例与像素重叠，与 Chromium 的翻页步长一致。
+const WHEEL_PAGE_MIN_FRACTION: f32 = 0.875;
+const WHEEL_PAGE_MAX_OVERLAP: f32 = 40.0;
 const RENDERING_SUSPENDED_PROP: PCWSTR = w!("GPUI.RenderingSuspended");
 
 pub(crate) fn window_is_renderable(handle: HWND) -> bool {
@@ -679,8 +686,13 @@ impl WindowsWindowInner {
                 .get(),
         };
 
-        let wheel_distance =
-            (wparam.signed_hiword() as f32 / WHEEL_DELTA as f32) * wheel_scroll_amount as f32;
+        let wheel_distance = wheel_scroll_distance(
+            handle,
+            wparam.signed_hiword() as f32 / WHEEL_DELTA as f32,
+            wheel_scroll_amount,
+            modifiers.shift,
+            scale_factor,
+        );
         let mut cursor_point = POINT {
             x: lparam.signed_loword().into(),
             y: lparam.signed_hiword().into(),
@@ -688,15 +700,9 @@ impl WindowsWindowInner {
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
         let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
             position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
-            delta: ScrollDelta::Lines(match modifiers.shift {
-                true => Point {
-                    x: wheel_distance,
-                    y: 0.0,
-                },
-                false => Point {
-                    y: wheel_distance,
-                    x: 0.0,
-                },
+            delta: ScrollDelta::Pixels(match modifiers.shift {
+                true => point(wheel_distance, px(0.0)),
+                false => point(px(0.0), wheel_distance),
             }),
             modifiers,
             touch_phase: TouchPhase::Moved,
@@ -723,8 +729,13 @@ impl WindowsWindowInner {
             .wheel_scroll_chars
             .get();
 
-        let wheel_distance =
-            (-wparam.signed_hiword() as f32 / WHEEL_DELTA as f32) * wheel_scroll_chars as f32;
+        let wheel_distance = wheel_scroll_distance(
+            handle,
+            -wparam.signed_hiword() as f32 / WHEEL_DELTA as f32,
+            wheel_scroll_chars,
+            true,
+            scale_factor,
+        );
         let mut cursor_point = POINT {
             x: lparam.signed_loword().into(),
             y: lparam.signed_hiword().into(),
@@ -732,10 +743,7 @@ impl WindowsWindowInner {
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
         let event = PlatformInput::ScrollWheel(ScrollWheelEvent {
             position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
-            delta: ScrollDelta::Lines(Point {
-                x: wheel_distance,
-                y: 0.0,
-            }),
+            delta: ScrollDelta::Pixels(point(wheel_distance, px(0.0))),
             modifiers: current_modifiers(),
             touch_phase: TouchPhase::Moved,
         });
@@ -2042,6 +2050,20 @@ fn is_non_activating_window(handle: HWND) -> bool {
 
 fn mouse_activate_result(handle: HWND) -> isize {
     if is_non_activating_window(handle) {
+        // MA_NOACTIVATE 不会调整 Z 序，多个置顶的不可激活窗口（如便签）点击后无法互相压过。
+        // 这里手动提到同层级（置顶窗口仍在置顶组内）最前，但不激活窗口。
+        unsafe {
+            SetWindowPos(
+                handle,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
+            )
+            .log_err();
+        }
         MA_NOACTIVATE as isize
     } else {
         MA_ACTIVATE as isize
@@ -2069,4 +2091,35 @@ fn notify_frame_changed(handle: HWND) {
         )
         .log_err();
     }
+}
+
+/// 把滚轮格数换算为逻辑像素：行数取系统设置，每格最多滚动窗口可视区的一页。
+/// “一次滚动一个屏幕”直接按一页滚动，避免把 WHEEL_PAGESCROLL 当作行数导致跳到首尾。
+fn wheel_scroll_distance(
+    handle: HWND,
+    notches: f32,
+    scroll_amount: u32,
+    horizontal: bool,
+    scale_factor: f32,
+) -> Pixels {
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(handle, &mut rect).log_err() };
+    let extent = match horizontal {
+        true => rect.right - rect.left,
+        false => rect.bottom - rect.top,
+    } as f32
+        / scale_factor;
+    let page = wheel_page_step(extent);
+    let per_notch = match scroll_amount {
+        WHEEL_PAGESCROLL => page,
+        lines => (lines as f32 * WHEEL_PIXELS_PER_LINE).min(page),
+    };
+    px(notches * per_notch)
+}
+
+/// 一页的滚动步长，保留一部分上一页内容作为重叠，避免跳过内容。
+fn wheel_page_step(extent: f32) -> f32 {
+    (extent * WHEEL_PAGE_MIN_FRACTION)
+        .max(extent - WHEEL_PAGE_MAX_OVERLAP)
+        .max(0.0)
 }

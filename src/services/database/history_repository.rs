@@ -90,6 +90,21 @@ impl HistoryRepository {
         }
     }
 
+    pub fn history_id_for_item(
+        &self,
+        item_id: ClipboardItemId,
+    ) -> Result<Option<HistoryItemId>, HistoryQueryError> {
+        let connection = self.database.connect()?;
+        connection
+            .query_row(
+                "SELECT id FROM clipboard_history WHERE item_id = ?1",
+                [item_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(HistoryQueryError::from)
+    }
+
     #[cfg(test)]
     pub fn query(&self, query: &HistoryQuery) -> Result<Vec<HistoryListRecord>, HistoryQueryError> {
         self.query_internal(query, None, None, None)

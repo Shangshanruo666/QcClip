@@ -1796,6 +1796,7 @@ fn start_data_replacement(
     ) {
         return;
     }
+    crate::services::quick_favorite::QuickFavoriteService::suspend(cx);
     let translator = crate::i18n::translator(cx);
     view.update(cx, |view, cx| {
         view.data_busy = true;
@@ -1855,6 +1856,11 @@ fn start_data_replacement(
                         image_preview_service,
                         cx,
                     );
+                    crate::services::quick_favorite::QuickFavoriteService::replace_data_sources(
+                        database.clone(),
+                        blob_store.clone(),
+                        cx,
+                    );
                     crate::config_runtime::ConfigRuntime::apply_imported_config(config_reload, cx);
                 });
                 drop(switch_guard);
@@ -1868,6 +1874,12 @@ fn start_data_replacement(
                     let clipboard_write_suppressor =
                         crate::windows::main::MainWindowService::clipboard_write_suppressor(cx)
                             .unwrap_or_default();
+                    crate::windows::sticky::StickyService::replace_data_sources(
+                        database.clone(),
+                        blob_store.clone(),
+                        clipboard_write_suppressor.clone(),
+                        cx,
+                    );
                     crate::windows::quick_paste::QuickPasteWindowService::replace_data_sources(
                         database,
                         blob_store,
@@ -1933,7 +1945,10 @@ fn start_data_replacement(
                 });
             }
         }
-        cx.update(crate::windows::main::MainWindowService::finish_blocking_operation);
+        cx.update(|cx| {
+            crate::windows::main::MainWindowService::finish_blocking_operation(cx);
+            crate::services::quick_favorite::QuickFavoriteService::resume(cx);
+        });
     })
     .detach();
 }

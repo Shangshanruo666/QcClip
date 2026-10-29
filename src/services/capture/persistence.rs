@@ -932,6 +932,35 @@ mod tests {
     }
 
     #[test]
+    fn capture_store_result_exposes_item_id_for_new_and_duplicate_capture() {
+        let services = TestServices::new(64);
+        let captured = MockClipboardSource::text("hello").capture();
+
+        let first = services
+            .service
+            .store_captured_clipboard_with_status(&captured)
+            .expect("无法保存首次捕获");
+        let second = services
+            .service
+            .store_captured_clipboard_with_status(&captured)
+            .expect("无法保存重复捕获");
+
+        assert!(first.is_new);
+        assert!(!second.is_new);
+        assert_eq!(first.item_id, second.item_id);
+        assert_eq!(first.history_id, second.history_id);
+        let item_id: i64 = services
+            .connect()
+            .query_row(
+                "SELECT item_id FROM clipboard_history WHERE id = ?1",
+                [first.history_id],
+                |row| row.get(0),
+            )
+            .expect("无法查询历史条目内容 ID");
+        assert_eq!(item_id, first.item_id);
+    }
+
+    #[test]
     fn failed_formats_are_recorded_but_excluded_from_raw_byte_total() {
         let services = TestServices::new(64);
         let captured = MockClipboardSource::text_with_failed_image("hello").capture();

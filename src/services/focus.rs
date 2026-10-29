@@ -1,7 +1,10 @@
 use gpui::Window;
 
 #[cfg(target_os = "windows")]
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicIsize, Ordering},
+};
 
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -20,6 +23,10 @@ use windows::Win32::{
 
 #[cfg(target_os = "windows")]
 static FOCUS_SESSION: Mutex<Option<FocusSession>> = Mutex::new(None);
+
+/// 最近一次成为前台的外部窗口，作为主窗口意外取得前台时的粘贴目标兜底。
+#[cfg(target_os = "windows")]
+static LAST_EXTERNAL_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
 
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy)]
@@ -74,6 +81,41 @@ pub fn restore_previous_focus() -> Result<(), String> {
     Ok(())
 }
 
+/// 仅当当前输入会话属于 `window` 时才恢复之前的焦点。其他窗口（如便签）的输入会话
+/// 保持不变，此时前台仍是该窗口的输入框，粘贴会直接落到其中。
+pub fn restore_previous_focus_for(window: &Window) -> Result<(), String> {
+    if !session_belongs_to(window)? {
+        return Ok(());
+    }
+    restore_previous_focus()
+}
+
+/// 仅当当前输入会话属于 `window` 时才丢弃会话。焦点已切到其他窗口的输入框时，
+/// 旧窗口的失焦或失活回调不能影响新窗口的会话。
+pub fn clear_previous_focus_for(window: &Window) -> Result<(), String> {
+    if !session_belongs_to(window)? {
+        return Ok(());
+    }
+    clear_previous_focus()
+}
+
+fn session_belongs_to(window: &Window) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let input_window = FOCUS_SESSION
+            .lock()
+            .map_err(|_| "读取之前的窗口焦点失败".to_owned())?
+            .map(|session| session.input_window);
+        Ok(input_window.is_some() && input_window == current_window_handle(window))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        Ok(true)
+    }
+}
+
 /// 主窗口内的输入框正持有系统焦点时返回 true，此时粘贴快捷键应直接作用于该输入框。
 pub fn input_window_is_foreground() -> bool {
     #[cfg(target_os = "windows")]
@@ -87,6 +129,40 @@ pub fn input_window_is_foreground() -> bool {
 
     #[cfg(not(target_os = "windows"))]
     false
+}
+
+/// 记录前台窗口变化，只保留本程序之外且非系统外壳的窗口。
+pub(crate) fn record_foreground_window(window: isize) {
+    #[cfg(target_os = "windows")]
+    if is_external_window(window) {
+        LAST_EXTERNAL_FOREGROUND.store(window, Ordering::Release);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
+}
+
+/// 粘贴前兜底：本程序的不可激活窗口按设计不应持有前台，若仍持有（例如系统在点击时
+/// 绕过了 WS_EX_NOACTIVATE），则把前台交还给最近的外部窗口，避免粘贴落到本程序窗口。
+pub fn ensure_external_paste_target() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(foreground) = current_foreground_window() else {
+            return Ok(());
+        };
+        if !is_current_process_window(foreground) || !is_non_activating_window(foreground) {
+            return Ok(());
+        }
+
+        let target = LAST_EXTERNAL_FOREGROUND.load(Ordering::Acquire);
+        if target == 0 || !is_external_window(target) {
+            return Err("本程序的不可激活窗口持有前台，且没有可恢复的外部窗口".to_owned());
+        }
+        tracing::warn!("粘贴前发现本程序的不可激活窗口持有前台，已交还给最近的外部窗口");
+        activate_native_window(target)?;
+    }
+
+    Ok(())
 }
 
 /// 恢复 Raw Input 按下时捕获的外部窗口焦点，不保存焦点状态。
@@ -127,12 +203,10 @@ fn focus_input_window_windows(window: &Window) -> Result<(), String> {
         return Err("输入窗口句柄已失效，无法同步窗口焦点".to_owned());
     }
 
-    let previous_input_window = {
-        let focus_session = FOCUS_SESSION
-            .lock()
-            .map_err(|_| "读取当前窗口焦点会话失败".to_owned())?;
-        focus_session.map(|session| session.input_window)
-    };
+    let previous_session = *FOCUS_SESSION
+        .lock()
+        .map_err(|_| "读取当前窗口焦点会话失败".to_owned())?;
+    let previous_input_window = previous_session.map(|session| session.input_window);
 
     if let Some(previous_input_window) = previous_input_window
         && previous_input_window != input_window
@@ -143,9 +217,15 @@ fn focus_input_window_windows(window: &Window) -> Result<(), String> {
 
     let new_session = previous_input_window != Some(input_window);
     if new_session {
-        let target_window = current_foreground_window()
-            .filter(|window| *window != input_window)
-            .filter(|window| is_valid_window(*window));
+        // 从本程序另一个仍持有前台的输入窗口切换过来时（如便签之间切换），沿用其保存的
+        // 目标窗口；否则当前前台就是旧输入窗口，失焦后会把焦点还给它而不是真正的目标。
+        let foreground = current_foreground_window();
+        let target_window = match previous_session {
+            Some(session) if foreground == Some(session.input_window) => session.target_window,
+            _ => foreground,
+        }
+        .filter(|window| *window != input_window)
+        .filter(|window| is_valid_window(*window));
         *FOCUS_SESSION
             .lock()
             .map_err(|_| "保存之前的窗口焦点失败".to_owned())? = Some(FocusSession {
@@ -211,6 +291,13 @@ fn set_window_non_activating(window: isize, non_activating: bool) -> Result<(), 
         .map_err(|error| format!("更新窗口激活样式失败：{error}"))?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn is_non_activating_window(window: isize) -> bool {
+    // SAFETY: 只读取窗口扩展样式，调用方已确认句柄属于当前进程。
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd_from_value(window), GWL_EXSTYLE) };
+    ex_style & WS_EX_NOACTIVATE.0 as isize != 0
 }
 
 #[cfg(target_os = "windows")]

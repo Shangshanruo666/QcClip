@@ -464,17 +464,28 @@ impl MainWindow {
                 let result = cx.update(|cx| {
                     crate::windows::preview::PreviewWindowService::hide(cx);
                     crate::windows::main::MainWindowService::cancel_hover_preview(cx);
-                    crate::windows::note_editor::open(
-                        item_id,
-                        text,
-                        repository,
-                        move |cx| {
-                            main_window.update(cx, |this, cx| {
-                                this.refresh_list_item_for_tab(source_tab, history_id, cx);
-                            })
-                        },
-                        cx,
-                    )
+                    // 主窗口不可激活，active_window 常为空，需显式传入主窗口作为模态调用方。
+                    let Some(owner) = crate::windows::main::MainWindowService::window_handle(cx)
+                    else {
+                        return Err("未找到主窗口".to_owned());
+                    };
+                    owner
+                        .update(cx, |_, window, cx| {
+                            crate::windows::note_editor::open(
+                                Some(window),
+                                item_id,
+                                text,
+                                repository,
+                                move |cx| {
+                                    main_window.update(cx, |this, cx| {
+                                        this.refresh_list_item_for_tab(source_tab, history_id, cx);
+                                    })
+                                },
+                                cx,
+                            )
+                        })
+                        .map_err(|error| error.to_string())
+                        .flatten()
                 });
                 if let Err(error) = result {
                     tracing::error!("打开备注编辑窗口失败：{error}");
@@ -674,56 +685,9 @@ impl MainWindow {
         self._window_bounds_subscription = Some(subscription);
     }
 
-    /// 打开新增收藏窗口；确认后在同一事务中创建文本内容和收藏关系。
+    /// 打开新增收藏窗口；已有编辑器时只聚焦，否则打开手动条目编辑器。
     pub fn new_favorite_item(&mut self, cx: &mut Context<Self>) {
-        let tag_repository = self.tag_repository.clone();
-        let task = cx.background_spawn(async move { tag_repository.list() });
-        cx.spawn(async move |this, cx| match task.await {
-            Ok(tags) => {
-                if let Some(this) = this.upgrade() {
-                    this.update(cx, |this, cx| {
-                        this.open_new_favorite_item_with_tags(tags, cx);
-                    });
-                }
-            }
-            Err(error) => tracing::error!("读取新增收藏标签失败：{error}"),
-        })
-        .detach();
-    }
-
-    pub(super) fn open_new_favorite_item_with_tags(
-        &mut self,
-        tags: Vec<Tag>,
-        cx: &mut Context<Self>,
-    ) {
-        let custom_text_service = self.custom_text_service.clone();
-        let main_window = cx.entity();
-        let on_confirm = Box::new(move |text: String, tag_ids: Vec<i64>, cx: &mut gpui::App| {
-            let save_task = cx.background_executor().spawn(async move {
-                custom_text_service.create_manual_text_and_favorite_with_tags(&text, &tag_ids)
-            });
-            cx.spawn(async move |cx| match save_task.await {
-                Ok(history_id) => {
-                    main_window.update(cx, |this, cx| {
-                        if this.active_tab == TabId::Clipboard {
-                            this.refresh_new_list_item(history_id, cx);
-                        } else {
-                            this.refresh_history(cx);
-                        }
-                    });
-                }
-                Err(error) => tracing::error!("新增收藏失败：{error}"),
-            })
-            .detach();
-        });
-        if let Err(error) = crate::windows::custom_text_editor::open_new_favorite(
-            String::new(),
-            tags,
-            on_confirm,
-            cx,
-        ) {
-            tracing::error!("打开新增收藏窗口失败：{error}");
-        }
+        crate::services::quick_favorite::QuickFavoriteService::open(false, cx);
     }
 
     /// 使用系统默认程序打开条目：文件类型直接打开路径，图片类型生成临时文件后打开。
@@ -797,6 +761,28 @@ impl MainWindow {
     ) -> Result<Vec<crate::platform::clipboard::ClipboardPayload>, crate::services::paste::PasteError>
     {
         self.paste_service.load_payloads_for_item(item_id)
+    }
+
+    /// 多选拖拽：按选择顺序合并所选条目，失败原因直接用于提示。
+    #[cfg(target_os = "windows")]
+    pub(crate) fn load_multi_drag_payloads(
+        &self,
+    ) -> Result<
+        (
+            Vec<crate::platform::clipboard::ClipboardPayload>,
+            Vec<crate::platform::image_temp_file::ImageTempFile>,
+        ),
+        String,
+    > {
+        let item_ids = resolve_multi_selection_item_ids(
+            self.active_tab,
+            &self.multi_selected_item_ids,
+            &self.history_repository,
+            &self.favorite_repository,
+        )?;
+        self.paste_service
+            .load_merged_drag_payloads(&item_ids)
+            .map_err(|error| error.to_string())
     }
 
     /// 读取条目首个纯文本格式的完整内容，用于右键菜单“在浏览器中打开”解析链接。

@@ -166,9 +166,55 @@ impl ListItemMetrics {
         self.with_preview_height(preview_height, preview_line_count)
     }
 
+    /// 按 HTML 中文本和图片的实际顺序累计自适应预览高度。
+    ///
+    /// 图片高度上限与列表渲染时传给 HTML 渲染器的上限一致，保证估算高度与绘制高度相同。
+    fn with_adaptive_html_segments(
+        self,
+        segments: &[html_preview::PreviewSegment],
+        available_width: Pixels,
+        window: &Window,
+    ) -> Self {
+        let line_height = f32::from(self.preview_line_height).max(1.0);
+        let max_image_height = line_height * ADAPTIVE_IMAGE_PREVIEW_LINES as f32;
+        let max_lines = self.adaptive_max_lines.max(ADAPTIVE_IMAGE_PREVIEW_LINES);
+        let max_height = line_height * max_lines as f32;
+        let available_width = f32::from(available_width).max(1.0);
+        let mut height = 0.0;
+        for segment in segments {
+            if height >= max_height {
+                break;
+            }
+            match segment {
+                html_preview::PreviewSegment::Text(text) => {
+                    let remaining_lines = ((max_height - height) / line_height).ceil() as usize;
+                    let lines = measure_text_lines(
+                        text,
+                        px(available_width),
+                        self.preview_font_size,
+                        remaining_lines.max(1),
+                        window,
+                    );
+                    // 渲染器为每个文本块追加 2px 底部间距。
+                    height += line_height * lines as f32 + 2.0;
+                }
+                html_preview::PreviewSegment::Image(size) => {
+                    let width = f32::from(size.width).max(1.0);
+                    let natural_height = f32::from(size.height).max(1.0);
+                    let fitted_height = natural_height * (available_width / width).min(1.0);
+                    height += fitted_height.min(max_image_height);
+                }
+            }
+        }
+        let height = height.clamp(line_height, max_height);
+        let preview_line_count = (height / line_height).ceil() as usize;
+        self.with_preview_height(px(height), preview_line_count)
+    }
+
     pub(super) fn for_preview(
         self,
         preview: Option<&FormatPreview>,
+        html_images: &HashMap<PathBuf, Arc<RenderImage>>,
         file_count: Option<usize>,
         available_width: Pixels,
         window: &Window,
@@ -206,6 +252,20 @@ impl ListItemMetrics {
                 ADAPTIVE_IMAGE_PREVIEW_LINES,
                 ADAPTIVE_IMAGE_PREVIEW_LINES,
             );
+        }
+
+        if let Some(html) = preview
+            .filter(|preview| preview.role() == FormatRole::Html)
+            .and_then(|preview| preview.html_content.as_deref())
+        {
+            let segments = html_preview::preview_segments(html, html_images);
+            // 没有已加载图片时与纯文本预览一致，避免图片缺失时改变原有行高。
+            if segments
+                .iter()
+                .any(|segment| matches!(segment, html_preview::PreviewSegment::Image(_)))
+            {
+                return self.with_adaptive_html_segments(&segments, available_width, window);
+            }
         }
 
         let preview_line_count = preview
@@ -424,6 +484,7 @@ impl ListItemMetrics {
         self,
         item: &ClipboardListItem,
         display_priority: ClipboardDisplayPriority,
+        html_images: &HashMap<PathBuf, Arc<RenderImage>>,
         file_count: Option<usize>,
         available_width: Pixels,
         window: &Window,
@@ -444,7 +505,13 @@ impl ListItemMetrics {
             ));
         }
         let preview = item_preview(item, display_priority);
-        let metrics = self.for_preview(preview.as_ref(), file_count, available_width, window);
+        let metrics = self.for_preview(
+            preview.as_ref(),
+            html_images,
+            file_count,
+            available_width,
+            window,
+        );
         if !item.note_text.is_empty() && self.height == ListItemHeight::Adaptive {
             metrics.with_preview_height(
                 metrics.preview_height + metrics.preview_line_height,

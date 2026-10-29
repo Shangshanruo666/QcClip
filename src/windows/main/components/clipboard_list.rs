@@ -76,9 +76,9 @@ mod metrics;
 
 pub(crate) use context_menu::confirm_remove_from_favorites;
 use context_menu::{
-    OPEN_ALL_LINKS_ACTION, OPEN_LINK_ACTION_PREFIX, OPEN_WITH_DEFAULT_ACTION,
-    favorite_item_context_menu, history_item_context_menu, parse_toggle_tag_action,
-    tag_color_value, truncate_link_label,
+    OPEN_ALL_LINKS_ACTION, OPEN_LINK_ACTION_PREFIX, OPEN_WITH_DEFAULT_ACTION, PIN_TO_SCREEN_ACTION,
+    SPLIT_WORDS_ACTION, favorite_item_context_menu, history_item_context_menu,
+    parse_toggle_tag_action, tag_color_value, truncate_link_label,
 };
 use metrics::*;
 
@@ -100,6 +100,9 @@ const LIST_ITEM_LOAD_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const LIST_ITEM_LOAD_ANIMATION_DELAY: Duration = Duration::from_millis(10);
 const LIST_ITEM_LOAD_ANIMATION_MAX_DELAY: Duration = Duration::from_millis(20);
 const DRAG_PREVIEW_BACKGROUND_OPACITY: f32 = 0.8;
+/// 多选拖拽预览中每层堆叠卡片相对上一层的错位距离。
+const DRAG_STACK_STEP: f32 = 6.0;
+const DRAG_STACK_MAX_LAYERS: usize = 2;
 const LIST_BOTTOM_BAR_HEIGHT: f32 = 6.0;
 const ADD_TO_FAVORITES_ACTION: &str = "add-to-favorites";
 const EDIT_ITEM_ACTION: &str = "edit-item";
@@ -119,6 +122,18 @@ struct ListItemDrag {
     source_app_icon: Option<Arc<RenderImage>>,
     file_list: Option<Entity<FileListView>>,
     preview_size: Rc<Cell<Option<Size<Pixels>>>>,
+    /// 拖拽开始时写入：大于 1 表示拖拽整个多选集合，预览显示为堆叠样式且不参与列表重排。
+    stack_count: Rc<Cell<usize>>,
+}
+
+impl ListItemDrag {
+    fn is_multi(&self) -> bool {
+        self.stack_count.get() > 1
+    }
+}
+
+fn drag_stack_offset(stack_count: usize) -> f32 {
+    stack_count.saturating_sub(1).min(DRAG_STACK_MAX_LAYERS) as f32 * DRAG_STACK_STEP
 }
 
 struct ListItemDragPreview {
@@ -278,6 +293,7 @@ pub fn render(
     total_item_count: usize,
     list_order_ids: &[HistoryItemId],
     loaded_items: &HashMap<HistoryItemId, ClipboardListItem>,
+    html_images: &HashMap<PathBuf, Arc<RenderImage>>,
     file_list_views: &HashMap<FileListKey, Entity<FileListView>>,
     toolbar_bottom: Pixels,
     toolbar_dragging: bool,
@@ -315,6 +331,7 @@ pub fn render(
             total_item_count,
             list_order_ids,
             loaded_items,
+            html_images,
             file_list_views,
             metrics,
             list_item_style,
@@ -471,6 +488,8 @@ fn horizontal_header_enabled(display: &crate::config::ItemDisplayConfig) -> bool
     let action_enabled = display.actions_visibility != ItemRegionVisibility::Hidden
         && [
             ItemDisplayField::Edit,
+            ItemDisplayField::PinToScreen,
+            ItemDisplayField::SplitWords,
             ItemDisplayField::Note,
             ItemDisplayField::PastePlain,
             ItemDisplayField::OpenDefault,
@@ -499,6 +518,7 @@ fn render_rows(
     total_item_count: usize,
     list_order_ids: &[HistoryItemId],
     loaded_items: &HashMap<HistoryItemId, ClipboardListItem>,
+    html_images: &HashMap<PathBuf, Arc<RenderImage>>,
     file_list_views: &HashMap<FileListKey, Entity<FileListView>>,
     metrics: ListItemMetrics,
     list_item_style: ListItemStyle,
@@ -596,7 +616,14 @@ fn render_rows(
                             file_list_view_for_item(item, display_priority, file_list_views)
                                 .map(|view| view.read(cx).path_count());
                         metrics
-                            .for_item(item, display_priority, file_count, preview_width, window)
+                            .for_item(
+                                item,
+                                display_priority,
+                                html_images,
+                                file_count,
+                                preview_width,
+                                window,
+                            )
                             .row_height
                     });
                 let row_height = resolve_row_height(
@@ -687,6 +714,7 @@ fn render_rows(
                             let row_metrics = metrics.for_item(
                                 &item,
                                 display_priority,
+                                &this.loaded_html_images,
                                 file_count,
                                 available_preview_width(
                                     list_width,
@@ -1115,6 +1143,8 @@ fn hover_action_fields(
     use ItemDisplayField::*;
     [
         Edit,
+        PinToScreen,
+        SplitWords,
         Note,
         PastePlain,
         OpenDefault,
@@ -1126,7 +1156,7 @@ fn hover_action_fields(
     .into_iter()
     .filter(|field| display.enabled(*field))
     .filter(|field| match field {
-        Edit => has_editable_text(item),
+        Edit | SplitWords => has_editable_text(item),
         PastePlain => item.all_format_options.iter().any(|preview| {
             preview.role() == FormatRole::PlainText
                 && preview.is_restorable
@@ -1330,6 +1360,36 @@ fn render_hover_action_buttons(
         )
     });
 
+    let pin_to_screen_button = hover_action_button(
+        ("hover-action-pin-to-screen", row_id as u64),
+        "sticker",
+        translator.translate("main.menu.pin_to_screen"),
+        theme.muted_foreground,
+        theme,
+        move |_, _, cx| {
+            cx.stop_propagation();
+            PreviewWindowService::hide(cx);
+            MainWindowService::cancel_hover_preview(cx);
+            crate::windows::sticky::StickyService::open(item_id, cx);
+        },
+    );
+
+    let split_words_button = has_editable_text(item).then(|| {
+        hover_action_button(
+            ("hover-action-split-words", row_id as u64),
+            "blocks",
+            translator.translate("main.menu.split_words"),
+            theme.muted_foreground,
+            theme,
+            move |_, _, cx| {
+                cx.stop_propagation();
+                PreviewWindowService::hide(cx);
+                MainWindowService::cancel_hover_preview(cx);
+                crate::windows::sticky::StickyService::open_split(item_id, cx);
+            },
+        )
+    });
+
     let note_window = main_window.clone();
     let note_button = hover_action_button(
         ("hover-action-note", row_id as u64),
@@ -1427,6 +1487,8 @@ fn render_hover_action_buttons(
 
     let buttons = [
         (ItemDisplayField::Edit, edit_button),
+        (ItemDisplayField::PinToScreen, Some(pin_to_screen_button)),
+        (ItemDisplayField::SplitWords, split_words_button),
         (ItemDisplayField::Note, Some(note_button)),
         (ItemDisplayField::PastePlain, paste_plain_button),
         (ItemDisplayField::OpenDefault, default_open_button),
@@ -1907,7 +1969,12 @@ fn render_item_surface<T>(
                     metrics.preview_line_height,
                     translator.translate("main.format.image_html"),
                     html_images,
-                    content_metrics.preview_line_count,
+                    // 自适应行高按固定的图片上限估算高度，渲染时必须使用同一上限。
+                    if metrics.height == ListItemHeight::Adaptive {
+                        ADAPTIVE_IMAGE_PREVIEW_LINES
+                    } else {
+                        content_metrics.preview_line_count
+                    },
                 ));
     } else {
         preview = preview
@@ -2241,19 +2308,19 @@ fn render_drag_preview(
             ),
             drag.metrics.horizontal,
         ));
-    if drag.list_item_style == ListItemStyle::Card {
+    let card_inset_x = if drag.metrics.horizontal {
+        drag.metrics.horizontal_card_inset
+    } else {
+        px(CARD_HORIZONTAL_INSET)
+    };
+    let front = if drag.list_item_style == ListItemStyle::Card {
         div()
             .h(preview_size.height)
             .w(preview_size.width)
             .flex_none()
-            .px(if drag.metrics.horizontal {
-                drag.metrics.horizontal_card_inset
-            } else {
-                px(CARD_HORIZONTAL_INSET)
-            })
+            .px(card_inset_x)
             .py(drag.metrics.card_vertical_inset)
             .child(row)
-            .into_any_element()
     } else {
         div()
             .relative()
@@ -2261,8 +2328,67 @@ fn render_drag_preview(
             .w(preview_size.width)
             .bg(preview_background)
             .child(row)
-            .into_any_element()
+    };
+
+    let stack_count = drag.stack_count.get();
+    if stack_count <= 1 {
+        return front.into_any_element();
     }
+
+    // 多选时在当前项后方叠放错位卡片并显示数量，避免平铺多项干扰视线。
+    let (card_origin, card_size, radius) = if drag.list_item_style == ListItemStyle::Card {
+        (
+            point(card_inset_x, drag.metrics.card_vertical_inset),
+            size(row_width, drag.metrics.content_height),
+            px(CARD_RADIUS),
+        )
+    } else {
+        (point(px(0.0), px(0.0)), preview_size, px(0.0))
+    };
+    let layer_count = (stack_count - 1).min(DRAG_STACK_MAX_LAYERS);
+    let stack_offset = px(drag_stack_offset(stack_count));
+    let layer = |offset: Pixels| {
+        div()
+            .absolute()
+            .left(card_origin.x + offset)
+            .top(card_origin.y + offset)
+            .w(card_size.width)
+            .h(card_size.height)
+            .rounded(radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+    };
+    let badge = div()
+        .absolute()
+        .top(card_origin.y + px(4.0))
+        .right(stack_offset + preview_size.width - card_origin.x - card_size.width + px(4.0))
+        .min_w(ui_rem(18.0))
+        .h(ui_rem(18.0))
+        .px(ui_rem(5.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(theme.primary)
+        .text_size(ui_rem(11.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme.primary_foreground)
+        .child(stack_count.to_string());
+    div()
+        .relative()
+        .w(preview_size.width + stack_offset)
+        .h(preview_size.height + stack_offset)
+        .children(
+            (1..=layer_count)
+                .rev()
+                .map(|depth| layer(px(depth as f32 * DRAG_STACK_STEP))),
+        )
+        // 当前项的背景是半透明的，垫一层不透明底色，避免透出后方卡片的边框。
+        .child(layer(px(0.0)).border_0())
+        .child(div().absolute().top_0().left_0().child(front))
+        .child(badge)
+        .into_any_element()
 }
 
 #[cfg(target_os = "windows")]
@@ -2590,7 +2716,7 @@ fn render_row(
         })
         .can_drop(move |dragged, _, _| {
             if let Some(drag) = dragged.downcast_ref::<ListItemDrag>() {
-                return can_reorder && drag.is_pinned == target_is_pinned;
+                return can_reorder && !drag.is_multi() && drag.is_pinned == target_is_pinned;
             }
             dragged
                 .downcast_ref::<TagDrag>()
@@ -2622,6 +2748,7 @@ fn render_row(
             source_app_icon: drag_source_app_icon,
             file_list: drag_file_list,
             preview_size: preview_size.clone(),
+            stack_count: Rc::new(Cell::new(1)),
         };
         let drag_window = main_window.clone();
         if list_item_style == ListItemStyle::Seamless {
@@ -2637,10 +2764,21 @@ fn render_row(
                     cx.stop_propagation();
                     PreviewWindowService::hide(cx);
                     let html_images = drag_window.read(cx).loaded_html_images.clone();
-                    drag_window.update(cx, |this, cx| {
-                        this.begin_reorder_drag(drag.history_id);
-                        cx.notify();
-                    });
+                    // 从多选集合中的一项开始拖拽时，整组作为一次外部拖拽，不做列表内重排。
+                    let multi_selected = &drag_window.read(cx).multi_selected_item_ids;
+                    let stack_count =
+                        if multi_selected.len() > 1 && multi_selected.contains(&drag.history_id) {
+                            multi_selected.len()
+                        } else {
+                            1
+                        };
+                    drag.stack_count.set(stack_count);
+                    if !drag.is_multi() {
+                        drag_window.update(cx, |this, cx| {
+                            this.begin_reorder_drag(drag.history_id);
+                            cx.notify();
+                        });
+                    }
                     #[cfg(target_os = "windows")]
                     let Some(preview_size) = drag.preview_size.get() else {
                         return cx.new(|_| ListItemDragPreview {
@@ -2651,7 +2789,13 @@ fn render_row(
                     };
                     #[cfg(target_os = "windows")]
                     let Some((initial_bounds, display_id, cursor_offset_physical)) =
-                        drag_preview_bounds(window, cx, cursor_offset, preview_size)
+                        drag_preview_bounds(window, cx, cursor_offset, {
+                            let stack_offset = px(drag_stack_offset(stack_count));
+                            size(
+                                preview_size.width + stack_offset,
+                                preview_size.height + stack_offset,
+                            )
+                        })
                     else {
                         return cx.new(|_| ListItemDragPreview {
                             drag: drag.clone(),
@@ -2696,15 +2840,44 @@ fn render_row(
                         ) {
                             tracing::error!("启动拖拽预览失败：{error}");
                         }
-                        match drag_window.read(cx).load_drag_payloads(drag.item.item_id) {
-                            Ok(payloads) => {
-                                if let Err(error) =
-                                    ExternalDragService::begin(source_window, payloads, cx)
-                                {
-                                    tracing::error!("准备外部拖拽失败：{error}");
+                        if drag.is_multi() {
+                            match drag_window.read(cx).load_multi_drag_payloads() {
+                                Ok((payloads, image_files)) => {
+                                    if let Err(error) = ExternalDragService::begin_with_files(
+                                        source_window,
+                                        payloads,
+                                        image_files,
+                                        cx,
+                                    ) {
+                                        tracing::error!("准备多选外部拖拽失败：{error}");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::error!("读取多选外部拖拽内容失败：{error}");
+                                    let translator = i18n::translator(cx);
+                                    crate::windows::notification::NotificationService::show_message(
+                                        translator.translate("main.multi_selection.drag"),
+                                        format!(
+                                            "{}：{error}",
+                                            translator
+                                                .translate("main.multi_selection.drag_failed")
+                                        ),
+                                        crate::windows::notification::NotificationLevel::Error,
+                                        cx,
+                                    );
                                 }
                             }
-                            Err(error) => tracing::error!("读取外部拖拽内容失败：{error}"),
+                        } else {
+                            match drag_window.read(cx).load_drag_payloads(drag.item.item_id) {
+                                Ok(payloads) => {
+                                    if let Err(error) =
+                                        ExternalDragService::begin(source_window, payloads, cx)
+                                    {
+                                        tracing::error!("准备外部拖拽失败：{error}");
+                                    }
+                                }
+                                Err(error) => tracing::error!("读取外部拖拽内容失败：{error}"),
+                            }
                         }
                     }
                     #[cfg(target_os = "windows")]
@@ -2718,6 +2891,9 @@ fn render_row(
                     let Some(drag) = event.dragged_item().downcast_ref::<ListItemDrag>() else {
                         return;
                     };
+                    if drag.is_multi() {
+                        return;
+                    }
                     if !event.bounds.contains(&window.mouse_position()) {
                         this.clear_list_drag_hover(row_id);
                         return;
@@ -2752,6 +2928,9 @@ fn render_row(
                 DragPreviewService::hide(cx);
                 #[cfg(target_os = "windows")]
                 ExternalDragService::cancel(cx);
+                if drag.is_multi() {
+                    return;
+                }
                 if drag.history_id != row_id && drag.is_pinned == target_is_pinned {
                     let target = ListDropTarget {
                         source_id: drag.history_id,
@@ -2918,6 +3097,14 @@ fn render_row(
                             }
                             return;
                         }
+                        if action.as_str() == PIN_TO_SCREEN_ACTION {
+                            crate::windows::sticky::StickyService::open(item_id, cx);
+                            return;
+                        }
+                        if action.as_str() == SPLIT_WORDS_ACTION {
+                            crate::windows::sticky::StickyService::open_split(item_id, cx);
+                            return;
+                        }
                         if action.as_str() == "remove-from-favorites" {
                             if let Some(favorite_id) = favorite_id {
                                 confirm_remove_from_favorites(
@@ -3001,6 +3188,14 @@ fn render_row(
                             for link in browser_links.iter() {
                                 cx.open_url(link);
                             }
+                            return;
+                        }
+                        if action.as_str() == PIN_TO_SCREEN_ACTION {
+                            crate::windows::sticky::StickyService::open(item_id, cx);
+                            return;
+                        }
+                        if action.as_str() == SPLIT_WORDS_ACTION {
+                            crate::windows::sticky::StickyService::open_split(item_id, cx);
                             return;
                         }
                         if action.as_str() == "remove-from-favorites" {

@@ -33,6 +33,8 @@ pub enum ItemDisplayField {
     Source,
     Shortcut,
     Edit,
+    PinToScreen,
+    SplitWords,
     Note,
     PastePlain,
     OpenDefault,
@@ -43,13 +45,15 @@ pub enum ItemDisplayField {
 }
 
 impl ItemDisplayField {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::Time,
         Self::Length,
         Self::ImageSize,
         Self::Source,
         Self::Shortcut,
         Self::Edit,
+        Self::PinToScreen,
+        Self::SplitWords,
         Self::Note,
         Self::PastePlain,
         Self::OpenDefault,
@@ -59,6 +63,16 @@ impl ItemDisplayField {
         Self::Delete,
     ];
 
+    /// 新增的操作按钮默认不显示，需要用户在设置里手动开启。
+    pub const DEFAULT_HIDDEN: [Self; 2] = [Self::PinToScreen, Self::SplitWords];
+
+    pub fn default_fields() -> Vec<Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|field| !Self::DEFAULT_HIDDEN.contains(field))
+            .collect()
+    }
+
     pub const fn label_key(self) -> &'static str {
         match self {
             Self::Time => "settings.item_display.time",
@@ -67,6 +81,8 @@ impl ItemDisplayField {
             Self::Source => "settings.item_display.source",
             Self::Shortcut => "settings.item_display.shortcut",
             Self::Edit => "main.menu.edit",
+            Self::PinToScreen => "main.menu.pin_to_screen",
+            Self::SplitWords => "main.menu.split_words",
             Self::Note => "main.note.edit",
             Self::PastePlain => "main.menu.paste_as_plain_text",
             Self::OpenDefault => "main.menu.open_with_default",
@@ -93,7 +109,7 @@ impl Default for ItemDisplayConfig {
             info_visibility: ItemRegionVisibility::Always,
             toolbar_visibility: ItemRegionVisibility::Always,
             actions_visibility: ItemRegionVisibility::Active,
-            fields: ItemDisplayField::ALL.to_vec(),
+            fields: ItemDisplayField::default_fields(),
         }
     }
 }
@@ -159,7 +175,7 @@ impl ItemDisplayPreset {
                 info_visibility: Hidden,
                 toolbar_visibility: Hidden,
                 actions_visibility: Hidden,
-                fields: ItemDisplayField::ALL.to_vec(),
+                fields: ItemDisplayField::default_fields(),
             },
             Self::Compact => ItemDisplayConfig {
                 info_visibility: Hidden,
@@ -193,6 +209,18 @@ mod tests {
         assert_eq!(config.preset(), Some(ItemDisplayPreset::Full));
         config.actions_visibility = ItemRegionVisibility::Active;
         assert_eq!(config.preset(), Some(ItemDisplayPreset::Standard));
+    }
+
+    #[test]
+    fn sticky_actions_are_hidden_by_default_and_can_be_enabled() {
+        let mut config = ItemDisplayConfig::default();
+        assert!(!config.enabled(ItemDisplayField::PinToScreen));
+        assert!(!config.enabled(ItemDisplayField::SplitWords));
+        config.set_enabled(ItemDisplayField::SplitWords, true);
+        assert!(config.enabled(ItemDisplayField::SplitWords));
+        assert_eq!(config.preset(), None);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("split-words"), "{json}");
     }
 
     #[test]

@@ -257,6 +257,23 @@ impl MainWindow {
         self.set_item_pinned(item.history_id, item.favorite_id, !item.is_pinned, cx);
     }
 
+    /// 把选中条目贴到屏幕；`split` 为 true 时直接进入拆词，只对含纯文本的条目生效。
+    pub(crate) fn pin_selected_to_screen(&mut self, split: bool, cx: &mut Context<Self>) {
+        let Some(item) = self.selected_list_item() else {
+            return;
+        };
+        if !split {
+            crate::windows::sticky::StickyService::open(item.item_id, cx);
+            return;
+        }
+        let has_text = item.all_format_options.iter().any(|preview| {
+            preview.is_restorable && preview.role() == crate::domain::capture::FormatRole::PlainText
+        });
+        if has_text {
+            crate::windows::sticky::StickyService::open_split(item.item_id, cx);
+        }
+    }
+
     pub(crate) fn delete_selected_item(&mut self, cx: &mut Context<Self>) {
         if self.active_tab == TabId::Favorites {
             return;

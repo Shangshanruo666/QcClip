@@ -207,6 +207,10 @@ fn track_press_offset(
     ))
 }
 
+fn is_scrollable(handle: &gpui::ScrollHandle, axis: Axis) -> bool {
+    handle.max_offset().along(axis) > px(0.0)
+}
+
 pub(super) fn render(
     buckets: Rc<Vec<HeatBucket>>,
     state: &HeatScrollbarState,
@@ -233,8 +237,10 @@ pub(super) fn render(
     let press_buckets = buckets.clone();
     let window_hovered = window.is_window_hovered();
     let pressed = state.drag_origin.is_some();
-    let visible = state.visible && (window_hovered || pressed);
-    let expanded = state.expanded() && (window_hovered || pressed);
+    // 内容不足一屏时没有可滚动距离，热度条不显示也不拦截列表的鼠标事件。
+    let scrollable = is_scrollable(scroll_handle.as_ref(), axis);
+    let visible = scrollable && state.visible && (window_hovered || pressed);
+    let expanded = scrollable && state.expanded() && (window_hovered || pressed);
     let animations_enabled = !cx.reduce_motion()
         && config_runtime::animation_enabled(cx, crate::config::AnimationKind::ListItemHover);
     let motion = Duration::from_millis(180).with_easing(gpui::ease_in_out);
@@ -252,16 +258,22 @@ pub(super) fn render(
         .when(!horizontal, |this| {
             this.right_0().top_0().bottom_0().w(ui_rem(28.0))
         })
-        .cursor_pointer()
-        .block_mouse_except_scroll()
-        .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-            this.set_heat_scrollbar_hovered(*hovered && window.is_window_hovered(), cx);
+        .when(scrollable, |this| {
+            this.cursor_pointer().block_mouse_except_scroll()
+        })
+        .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+            let scrollable = is_scrollable(this.list_scroll_handle.as_ref(), axis);
+            this.set_heat_scrollbar_hovered(
+                *hovered && scrollable && window.is_window_hovered(),
+                cx,
+            );
         }))
         .on_mouse_move(
             cx.listener(move |this, event: &gpui::MouseMoveEvent, window, cx| {
                 if !window.is_window_hovered()
                     || this.heat_scrollbar.drag_origin.is_some()
                     || !this.heat_scrollbar.bounds.contains(&event.position)
+                    || !is_scrollable(this.list_scroll_handle.as_ref(), axis)
                 {
                     return;
                 }
@@ -284,6 +296,9 @@ pub(super) fn render(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                if !is_scrollable(this.list_scroll_handle.as_ref(), axis) {
+                    return;
+                }
                 cx.stop_propagation();
                 this.set_heat_scrollbar_hovered(true, cx);
                 this.list_smooth_scroll.reset();

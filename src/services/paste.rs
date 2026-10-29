@@ -1,7 +1,10 @@
 use std::{
     io::Cursor,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -75,6 +78,17 @@ pub(crate) struct PastedItem {
     pub(crate) favorite: Option<(i64, u64)>,
     /// 实际被移到首位的列表；未启用、条目已置顶或已在首位时为空。
     pub(crate) moved_to_first: Option<PasteOrderTarget>,
+}
+
+/// 全局格式粘贴开关，由配置运行时同步；关闭后默认粘贴和合并粘贴优先只写入纯文本，指定格式粘贴不受影响。
+static FORMATTED_PASTE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub(crate) fn set_formatted_paste_enabled(enabled: bool) {
+    FORMATTED_PASTE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+fn formatted_paste_enabled() -> bool {
+    FORMATTED_PASTE_ENABLED.load(Ordering::Relaxed)
 }
 
 static PASTED_ITEM_SUBSCRIBERS: Mutex<Vec<async_channel::Sender<PastedItem>>> =
@@ -161,6 +175,17 @@ impl PasteService {
     }
 
     pub(crate) fn paste_item(
+        &self,
+        item_id: i64,
+        move_to_first: Option<PasteOrderTarget>,
+    ) -> Result<(), PasteError> {
+        if !formatted_paste_enabled() {
+            return self.paste_item_plain_text(item_id, move_to_first);
+        }
+        self.paste_item_with_default_formats(item_id, move_to_first)
+    }
+
+    fn paste_item_with_default_formats(
         &self,
         item_id: i64,
         move_to_first: Option<PasteOrderTarget>,
@@ -256,6 +281,11 @@ impl PasteService {
             payloads,
             image_files,
         } = prepared;
+        let payloads = if formatted_paste_enabled() {
+            payloads
+        } else {
+            plain_text_merged_payloads(payloads)
+        };
         let result = paste_into_active_window(&payloads, &self.clipboard_write_suppressor);
         for image_file in image_files {
             retain_image_temp_file(image_file);
@@ -289,17 +319,9 @@ impl PasteService {
     ) -> Result<(), PasteError> {
         let connection = self.database.connect()?;
         let payloads = self.load_payloads(&connection, item_id)?;
-        let Some(payload) = payloads
-            .iter()
-            .filter(|payload| {
-                payload_role(payload) == FormatRole::PlainText
-                    && !decode_text_payload(payload).trim().is_empty()
-            })
-            .min_by_key(|payload| plain_text_payload_priority(payload))
-            .cloned()
-        else {
+        let Some(payload) = preferred_plain_text_payload(&payloads) else {
             drop(connection);
-            return self.paste_item(item_id, move_to_first);
+            return self.paste_item_with_default_formats(item_id, move_to_first);
         };
 
         paste_into_active_window(&[payload], &self.clipboard_write_suppressor)
@@ -331,6 +353,18 @@ impl PasteService {
             .ok_or(PasteError::NoRestorableFormat)?;
         self.paste_item_plain_text(item_id, move_to_first)
             .map(|()| item_id)
+    }
+
+    /// 按多选顺序合并多个条目，供外部拖拽使用；返回的临时图片文件需在拖拽期间保持存活。
+    pub(crate) fn load_merged_drag_payloads(
+        &self,
+        item_ids: &[i64],
+    ) -> Result<(Vec<ClipboardPayload>, Vec<ImageTempFile>), PasteError> {
+        let MergedPayload {
+            payloads,
+            image_files,
+        } = self.load_merged_payloads(item_ids)?;
+        Ok((payloads, image_files))
     }
 
     pub fn load_payloads_for_item(
@@ -1128,6 +1162,32 @@ fn decode_text_payload(payload: &ClipboardPayload) -> String {
     }
 }
 
+/// 选取优先级最高的非空纯文本格式；条目没有可用纯文本时返回空。
+fn preferred_plain_text_payload(payloads: &[ClipboardPayload]) -> Option<ClipboardPayload> {
+    payloads
+        .iter()
+        .filter(|payload| {
+            payload_role(payload) == FormatRole::PlainText
+                && !decode_text_payload(payload).trim().is_empty()
+        })
+        .min_by_key(|payload| plain_text_payload_priority(payload))
+        .cloned()
+}
+
+/// 关闭格式粘贴时的合并载荷：文件和图片合并保持原样，避免只粘贴“[图片]”占位文本。
+fn plain_text_merged_payloads(payloads: Vec<ClipboardPayload>) -> Vec<ClipboardPayload> {
+    if payloads
+        .iter()
+        .any(|payload| payload_role(payload) == FormatRole::FileList)
+    {
+        return payloads;
+    }
+    match preferred_plain_text_payload(&payloads) {
+        Some(payload) => vec![payload],
+        None => payloads,
+    }
+}
+
 fn payload_role(payload: &ClipboardPayload) -> FormatRole {
     let kind = FormatKind::from_str(&payload.format_kind).unwrap_or(FormatKind::Unknown);
     classify_format_role(kind, &payload.format_key, &payload.format_name)
@@ -1187,6 +1247,30 @@ fn current_timestamp_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plain_text_merged_payloads_keeps_only_text_for_rich_merge() {
+        let payloads = super::plain_text_merged_payloads(vec![
+            super::text_payload(
+                "a
+
+b",
+            ),
+            super::html_payload("<b>a</b><i>b</i>"),
+        ]);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].format_key, "CF_UNICODETEXT");
+    }
+
+    #[test]
+    fn plain_text_merged_payloads_keeps_file_merge_unchanged() {
+        let payloads = super::plain_text_merged_payloads(vec![
+            super::file_list_payload(&[std::path::PathBuf::from(r"C:\a.png")]).unwrap(),
+            super::text_payload("[图片]"),
+            super::html_payload("<img>"),
+        ]);
+        assert_eq!(payloads.len(), 3);
+    }
+
     use crate::domain::capture::{CapturedClipboard, FormatKind, RawFormat, SourceApplication};
     use crate::services::{
         capture::{CaptureService, mock::MockClipboardSource},

@@ -191,6 +191,7 @@ impl Render for MainWindow {
                     self.total_item_count,
                     &self.list_order_ids,
                     &self.loaded_items,
+                    &self.loaded_html_images,
                     &self.file_list_views,
                     self.floating_toolbar_bottom,
                     self.floating_toolbar_drag.is_some(),

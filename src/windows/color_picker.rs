@@ -12,7 +12,7 @@ use gpui::{
     Point, Render, RenderImage, Window, canvas, div, linear_color_stop, linear_gradient, px, rgb,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{ActiveTheme as _, Sizable as _};
+use gpui_component::{ActiveTheme as _, Sizable as _, button::ButtonVariants as _};
 use image::{Frame, RgbaImage};
 
 use super::dialog::{
@@ -34,22 +34,60 @@ pub(crate) fn open_color_picker_window(
     on_done: impl FnOnce(u32, &mut App) + 'static,
     cx: &mut App,
 ) -> Result<gpui::WindowHandle<gpui_component::Root>, String> {
+    open_picker(
+        source_window,
+        initial_color,
+        None,
+        Box::new(move |color: Option<u32>, cx: &mut App| {
+            if let Some(color) = color {
+                on_done(color, cx);
+            }
+        }),
+        cx,
+    )
+}
+
+/// 带“恢复默认”按钮的颜色选择；选择默认时回调收到 `None`。
+pub(crate) fn open_color_picker_window_with_reset(
+    source_window: Option<&Window>,
+    initial_color: u32,
+    reset_label: String,
+    on_done: impl FnOnce(Option<u32>, &mut App) + 'static,
+    cx: &mut App,
+) -> Result<gpui::WindowHandle<gpui_component::Root>, String> {
+    open_picker(
+        source_window,
+        initial_color,
+        Some(reset_label),
+        Box::new(on_done),
+        cx,
+    )
+}
+
+fn open_picker(
+    source_window: Option<&Window>,
+    initial_color: u32,
+    reset_label: Option<String>,
+    on_done: DoneHandler,
+    cx: &mut App,
+) -> Result<gpui::WindowHandle<gpui_component::Root>, String> {
     dialog::open_adaptive_window(
         source_window,
         cx,
         DialogWindowPosition::Center,
         DialogMode::Modal,
         move |window, cx| {
-            cx.new(|cx| ColorPickerPanel::new(initial_color, Box::new(on_done), window, cx))
+            cx.new(|cx| ColorPickerPanel::new(initial_color, reset_label, on_done, window, cx))
         },
     )
 }
 
-type DoneHandler = Box<dyn FnOnce(u32, &mut App)>;
+type DoneHandler = Box<dyn FnOnce(Option<u32>, &mut App)>;
 
 pub(crate) struct ColorPickerPanel {
     selection: ColorSelection,
     on_done: Option<DoneHandler>,
+    reset_label: Option<String>,
     hex_input: Entity<InputState>,
     red_input: Entity<InputState>,
     green_input: Entity<InputState>,
@@ -63,6 +101,7 @@ pub(crate) struct ColorPickerPanel {
 impl ColorPickerPanel {
     fn new(
         initial_color: u32,
+        reset_label: Option<String>,
         on_done: DoneHandler,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -118,6 +157,7 @@ impl ColorPickerPanel {
         Self {
             selection,
             on_done: Some(on_done),
+            reset_label,
             hex_input,
             red_input,
             green_input,
@@ -285,6 +325,10 @@ impl ColorPickerPanel {
 
     fn done(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let color = self.selection.rgb();
+        self.finish(Some(color), window, cx);
+    }
+
+    fn finish(&mut self, color: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(on_done) = self.on_done.take() {
             on_done(color, cx);
         }
@@ -489,6 +533,16 @@ impl Render for ColorPickerPanel {
                                     ),
                             ),
                     )
+                    // 恢复默认单独一行，避免页脚按钮过多时挤出窗口。
+                    .children(self.reset_label.clone().map(|label| {
+                        div().flex().child(
+                            dialog_button("color-picker-reset", label).ghost().on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.finish(None, window, cx);
+                                }),
+                            ),
+                        )
+                    }))
                     .child(dialog_footer(
                         vec![
                             dialog_button(

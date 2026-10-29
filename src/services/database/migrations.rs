@@ -81,12 +81,6 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> 
             .execute_batch(include_str!("sync.sql"))
             .map_err(|source| DatabaseError::Migration { version: 2, source })?;
         transaction
-            .execute(
-                "UPDATE database_compatibility SET minimum_write_version = 2",
-                [],
-            )
-            .map_err(|source| DatabaseError::Migration { version: 2, source })?;
-        transaction
             .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(|source| DatabaseError::Migration { version: 1, source })?;
         validate_schema(&transaction)?;
@@ -111,7 +105,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> 
         let create =
             history_schema[..table_end].replacen("clipboard_history", "clipboard_history_v2", 1);
         let sql = format!(
-            "{create}\nINSERT INTO clipboard_history_v2 SELECT * FROM clipboard_history;\nDROP TABLE clipboard_history;\nALTER TABLE clipboard_history_v2 RENAME TO clipboard_history;\n{}\n{}\nUPDATE database_compatibility SET minimum_write_version = 2; PRAGMA user_version = 2;",
+            "{create}\nINSERT INTO clipboard_history_v2 SELECT * FROM clipboard_history;\nDROP TABLE clipboard_history;\nALTER TABLE clipboard_history_v2 RENAME TO clipboard_history;\n{}\n{}\nPRAGMA user_version = 2;",
             &history_schema[table_end..],
             include_str!("sync.sql")
         );

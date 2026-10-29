@@ -18,6 +18,7 @@ use crate::{
 type NoteSavedCallback = Box<dyn FnOnce(&mut App)>;
 
 pub(crate) fn open(
+    source_window: Option<&Window>,
     item_id: ClipboardItemId,
     text: String,
     repository: NoteRepository,
@@ -25,7 +26,7 @@ pub(crate) fn open(
     cx: &mut App,
 ) -> Result<(), String> {
     open_adaptive_window(
-        None,
+        source_window,
         cx,
         DialogWindowPosition::Center,
         DialogMode::Modal,

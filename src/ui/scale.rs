@@ -18,3 +18,8 @@ pub(crate) fn theme_scale(cx: &App) -> f32 {
 pub(crate) fn standalone_rem_size(base: f32, cx: &App) -> Pixels {
     px(base * crate::config_runtime::appearance_config(cx).ui_scale())
 }
+
+/// 悬停预览窗口的字号基准，在界面缩放之上再叠加预览缩放。
+pub(crate) fn preview_rem_size(base: f32, cx: &App) -> Pixels {
+    px(base * crate::config_runtime::appearance_config(cx).preview_scale())
+}

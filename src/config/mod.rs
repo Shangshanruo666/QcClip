@@ -221,10 +221,13 @@ pub struct ShortcutsConfig {
     pub middle_mouse: MiddleMouseShortcutConfig,
     pub open_settings: Option<ShortcutBinding>,
     pub toggle_clipboard_monitor: Option<ShortcutBinding>,
+    pub toggle_formatted_paste: Option<ShortcutBinding>,
     pub upload_latest: Option<ShortcutBinding>,
     pub pull_latest: Option<ShortcutBinding>,
     pub plain_text_paste: Option<ShortcutBinding>,
     pub quick_paste: Option<ShortcutBinding>,
+    pub add_favorite: Option<ShortcutBinding>,
+    pub add_favorite_open_editor_on_empty: bool,
     pub quick_paste_1_to_9: QuickPasteShortcutConfig,
     pub select_previous_item: SessionShortcutConfig,
     pub select_next_item: SessionShortcutConfig,
@@ -237,6 +240,8 @@ pub struct ShortcutsConfig {
     pub execute_paste: SessionShortcutConfig,
     pub toggle_favorite: SessionShortcutConfig,
     pub toggle_pinned: SessionShortcutConfig,
+    pub pin_to_screen: SessionShortcutConfig,
+    pub split_words: SessionShortcutConfig,
     pub delete_item: SessionShortcutConfig,
     pub hide_window: SessionShortcutConfig,
 }
@@ -248,10 +253,13 @@ impl Default for ShortcutsConfig {
             middle_mouse: MiddleMouseShortcutConfig::default(),
             open_settings: None,
             toggle_clipboard_monitor: None,
+            toggle_formatted_paste: None,
             upload_latest: None,
             pull_latest: None,
             plain_text_paste: None,
             quick_paste: None,
+            add_favorite: None,
+            add_favorite_open_editor_on_empty: true,
             quick_paste_1_to_9: QuickPasteShortcutConfig::default(),
             select_previous_item: SessionShortcutConfig::new(None, "up"),
             select_next_item: SessionShortcutConfig::new(None, "down"),
@@ -264,6 +272,8 @@ impl Default for ShortcutsConfig {
             execute_paste: SessionShortcutConfig::new(Some("control"), "enter"),
             toggle_favorite: SessionShortcutConfig::new(Some("control"), "d"),
             toggle_pinned: SessionShortcutConfig::new(Some("control"), "t"),
+            pin_to_screen: SessionShortcutConfig::new(Some("alt"), "t"),
+            split_words: SessionShortcutConfig::default(),
             delete_item: SessionShortcutConfig::new(None, "delete"),
             hide_window: SessionShortcutConfig::new(None, "escape"),
         }
@@ -324,12 +334,14 @@ pub enum SessionShortcutId {
     ExecutePaste,
     ToggleFavorite,
     TogglePinned,
+    PinToScreen,
+    SplitWords,
     DeleteItem,
     HideWindow,
 }
 
 impl SessionShortcutId {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::SelectPreviousItem,
         Self::SelectNextItem,
         Self::SelectFirstItem,
@@ -341,6 +353,8 @@ impl SessionShortcutId {
         Self::ExecutePaste,
         Self::ToggleFavorite,
         Self::TogglePinned,
+        Self::PinToScreen,
+        Self::SplitWords,
         Self::DeleteItem,
         Self::HideWindow,
     ];
@@ -358,6 +372,8 @@ impl SessionShortcutId {
             Self::ExecutePaste => "executePaste",
             Self::ToggleFavorite => "toggleFavorite",
             Self::TogglePinned => "togglePinned",
+            Self::PinToScreen => "pinToScreen",
+            Self::SplitWords => "splitWords",
             Self::DeleteItem => "deleteItem",
             Self::HideWindow => "hideWindow",
         }
@@ -376,6 +392,8 @@ impl SessionShortcutId {
             Self::ExecutePaste => "settings.shortcuts.execute_paste",
             Self::ToggleFavorite => "settings.shortcuts.toggle_favorite",
             Self::TogglePinned => "settings.shortcuts.toggle_pinned",
+            Self::PinToScreen => "settings.shortcuts.pin_to_screen",
+            Self::SplitWords => "settings.shortcuts.split_words",
             Self::DeleteItem => "settings.shortcuts.delete_item",
             Self::HideWindow => "settings.shortcuts.hide_window",
         }
@@ -400,6 +418,8 @@ impl ShortcutsConfig {
             SessionShortcutId::ExecutePaste => &self.execute_paste,
             SessionShortcutId::ToggleFavorite => &self.toggle_favorite,
             SessionShortcutId::TogglePinned => &self.toggle_pinned,
+            SessionShortcutId::PinToScreen => &self.pin_to_screen,
+            SessionShortcutId::SplitWords => &self.split_words,
             SessionShortcutId::DeleteItem => &self.delete_item,
             SessionShortcutId::HideWindow => &self.hide_window,
         }
@@ -418,6 +438,8 @@ impl ShortcutsConfig {
             SessionShortcutId::ExecutePaste => &mut self.execute_paste,
             SessionShortcutId::ToggleFavorite => &mut self.toggle_favorite,
             SessionShortcutId::TogglePinned => &mut self.toggle_pinned,
+            SessionShortcutId::PinToScreen => &mut self.pin_to_screen,
+            SessionShortcutId::SplitWords => &mut self.split_words,
             SessionShortcutId::DeleteItem => &mut self.delete_item,
             SessionShortcutId::HideWindow => &mut self.hide_window,
         }
@@ -780,6 +802,7 @@ pub struct ClipboardConfig {
     pub preview_priority: ClipboardPreviewPriority,
     pub preview_types: Vec<ClipboardPreviewType>,
     pub hover_preview_enabled: bool,
+    pub hover_preview_delay_ms: u16,
     pub heat_scrollbar_enabled: bool,
     pub page_hover_switch: bool,
     pub filter_hover_switch: bool,
@@ -787,6 +810,8 @@ pub struct ClipboardConfig {
     pub filter_hover_delay_ms: u16,
     pub move_pasted_to_first_in_clipboard: bool,
     pub move_pasted_to_first_in_favorites: bool,
+    /// 全局格式粘贴；关闭后默认粘贴和合并粘贴优先只粘贴纯文本，没有纯文本时按原格式粘贴；指定格式粘贴不受影响。
+    pub formatted_paste: bool,
     pub auto_scroll_to_top: bool,
     pub auto_focus_search: bool,
     pub auto_clear_search: bool,
@@ -1037,6 +1062,7 @@ impl Default for ClipboardConfig {
             preview_priority: ClipboardPreviewPriority::default(),
             preview_types: ClipboardPreviewType::ALL.to_vec(),
             hover_preview_enabled: true,
+            hover_preview_delay_ms: Self::HOVER_PREVIEW_DELAY_DEFAULT_MS,
             heat_scrollbar_enabled: true,
             page_hover_switch: false,
             filter_hover_switch: false,
@@ -1044,6 +1070,7 @@ impl Default for ClipboardConfig {
             filter_hover_delay_ms: Self::TAB_BAR_HOVER_DELAY_DEFAULT_MS,
             move_pasted_to_first_in_clipboard: false,
             move_pasted_to_first_in_favorites: false,
+            formatted_paste: true,
             auto_scroll_to_top: false,
             auto_focus_search: false,
             auto_clear_search: false,
@@ -1062,6 +1089,9 @@ impl ClipboardConfig {
     pub const TAB_BAR_HOVER_DELAY_MIN_MS: u16 = 0;
     pub const TAB_BAR_HOVER_DELAY_MAX_MS: u16 = 1000;
     pub const TAB_BAR_HOVER_DELAY_DEFAULT_MS: u16 = 40;
+    pub const HOVER_PREVIEW_DELAY_MIN_MS: u16 = 0;
+    pub const HOVER_PREVIEW_DELAY_MAX_MS: u16 = 2000;
+    pub const HOVER_PREVIEW_DELAY_DEFAULT_MS: u16 = 200;
 
     pub(crate) fn normalized(mut self) -> Self {
         self.capture_formats = self.capture_formats.normalized();
@@ -1078,6 +1108,10 @@ impl ClipboardConfig {
         self.filter_hover_delay_ms = self.filter_hover_delay_ms.clamp(
             Self::TAB_BAR_HOVER_DELAY_MIN_MS,
             Self::TAB_BAR_HOVER_DELAY_MAX_MS,
+        );
+        self.hover_preview_delay_ms = self.hover_preview_delay_ms.clamp(
+            Self::HOVER_PREVIEW_DELAY_MIN_MS,
+            Self::HOVER_PREVIEW_DELAY_MAX_MS,
         );
         self
     }
@@ -1518,6 +1552,8 @@ pub struct AppearanceConfig {
     pub pasted_item_border: bool,
     pub item_display: ItemDisplayConfig,
     pub preview_information: PreviewInformationConfig,
+    /// 悬停预览窗口在界面缩放基础上的额外缩放百分比。
+    pub preview_scale_percent: u16,
 }
 
 impl Default for AppearanceConfig {
@@ -1546,6 +1582,7 @@ impl Default for AppearanceConfig {
             pasted_item_border: true,
             item_display: ItemDisplayConfig::default(),
             preview_information: PreviewInformationConfig::default(),
+            preview_scale_percent: 100,
         }
     }
 }
@@ -1798,11 +1835,24 @@ impl AppearanceConfig {
         ) / 100.0
     }
 
+    /// 悬停预览窗口的最终缩放，叠加在界面缩放之上。
+    pub fn preview_scale(&self) -> f32 {
+        self.ui_scale()
+            * f32::from(
+                self.preview_scale_percent
+                    .clamp(UI_SCALE_PERCENT_MIN, UI_SCALE_PERCENT_MAX),
+            )
+            / 100.0
+    }
+
     pub(crate) fn normalized(mut self) -> Self {
         let default = Self::default();
         self.tab_bar.normalize();
         self.ui_scale_percent = self
             .ui_scale_percent
+            .clamp(UI_SCALE_PERCENT_MIN, UI_SCALE_PERCENT_MAX);
+        self.preview_scale_percent = self
+            .preview_scale_percent
             .clamp(UI_SCALE_PERCENT_MIN, UI_SCALE_PERCENT_MAX);
         self.app_font_family = self.app_font_family.and_then(|family| {
             let family = family.trim();
@@ -1918,6 +1968,8 @@ mod tests {
         );
         assert!(!config.clipboard.edge_hide);
         assert_eq!(config.quick_paste.visible_items, 7);
+        assert_eq!(config.shortcuts.add_favorite, None);
+        assert!(config.shortcuts.add_favorite_open_editor_on_empty);
         assert!(config.sound.enabled);
         assert_eq!(config.sound.paste.preset, SoundPreset::CrispChime);
         assert_eq!(config.sound.copy.preset, SoundPreset::BrightPing);
@@ -1952,8 +2004,11 @@ mod tests {
         );
         assert_eq!(value["clipboard"]["pageHoverDelayMs"], 40);
         assert_eq!(value["clipboard"]["filterHoverDelayMs"], 40);
+        assert_eq!(value["clipboard"]["hoverPreviewDelayMs"], 200);
         assert_eq!(value["clipboard"]["edgeHide"], false);
         assert_eq!(value["quickPaste"]["visibleItems"], 7);
+        assert_eq!(value["shortcuts"]["addFavorite"], serde_json::Value::Null);
+        assert_eq!(value["shortcuts"]["addFavoriteOpenEditorOnEmpty"], true);
         assert_eq!(value["sound"]["enabled"], true);
         assert_eq!(value["sound"]["paste"]["preset"], "crisp-chime");
         assert_eq!(value["sound"]["paste"]["volume"], 70);

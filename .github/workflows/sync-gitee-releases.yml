@@ -2,18 +2,13 @@ name: 同步 QcClip GitHub Releases 到 Gitee
 
 on:
   release:
-    types: [published, edited, deleted]
+    # 不处理 deleted：删除 Gitee Release 会连同手动上传的附件一起删除。
+    types: [published, edited]
   workflow_dispatch:
     inputs:
-      reorder:
-        description: '重建 Gitee Releases 顺序；会删除并重新创建所有 Gitee Release'
-        required: false
-        default: false
-        type: boolean
       tag:
-        description: '只同步指定版本标签，例如 v1.0.0-beta.4；留空则同步全部版本'
-        required: false
-        default: ''
+        description: '要同步的版本标签，例如 v1.0.0-beta.4；只同步版本信息，不处理附件'
+        required: true
         type: string
 
 permissions:
@@ -27,16 +22,15 @@ jobs:
   sync:
     if: github.repository == 'mosheng1/QcClip'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
     env:
       GITEE_REPO: mk-mo-sheng/QcClip
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
       GH_TOKEN: ${{ github.token }}
-      REORDER_RELEASES: ${{ inputs.reorder || false }}
       SYNC_TAG: ${{ inputs.tag || '' }}
 
     steps:
-      - name: 检出完整标签历史
+      - name: 检出代码和标签
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -65,17 +59,17 @@ jobs:
           set -euo pipefail
           remote="https://oauth2:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
           if [[ "${GITHUB_EVENT_NAME}" == 'workflow_dispatch' ]]; then
-            if [[ -n "${SYNC_TAG}" ]]; then
-              git push --quiet "${remote}" \
-                "refs/tags/${SYNC_TAG}:refs/tags/${SYNC_TAG}"
-            else
-              git push --quiet "${remote}" --tags
-            fi
-          elif [[ "${GITHUB_EVENT_NAME}" != 'release' || "${{ github.event.action }}" != 'deleted' ]]; then
-            git push --quiet "${remote}" \
-              "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+            tag="${SYNC_TAG}"
+          else
+            tag="${GITHUB_REF_NAME}"
           fi
+          if ! git rev-parse --verify --quiet "refs/tags/${tag}" > /dev/null; then
+            echo "仓库中没有标签：${tag}" >&2
+            exit 1
+          fi
+          git push --quiet "${remote}" "refs/tags/${tag}:refs/tags/${tag}"
 
-      - name: 同步发布说明和附件
+      # 只同步版本信息，附件在 Gitee 手动上传；已存在的附件保留。
+      - name: 同步发布说明
         shell: bash
         run: python3 .github/scripts/sync-gitee-releases.py

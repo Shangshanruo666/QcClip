@@ -86,6 +86,16 @@ impl TransientClipboardFilter {
             return ready;
         }
 
+        // 部分应用会分多次写入同一内容（先文件路径、再补位图），新快照包含上一条待确认内容的全部格式时视为同一次复制。
+        if self
+            .pending
+            .back()
+            .is_some_and(|pending| is_restored_content(&fingerprint, &pending.fingerprint))
+        {
+            tracing::debug!("剪贴板内容在确认前补充了格式，合并为同一次捕获");
+            self.pending.pop_back();
+        }
+
         self.pending.push_back(PendingCapture {
             observation,
             fingerprint,
@@ -922,6 +932,50 @@ mod tests {
         drop(input);
         filter_events(receiver, sender, Some(text("原内容")));
         assert_eq!(output.into_iter().collect::<Vec<_>>(), vec![Ok(normal)]);
+    }
+
+    #[test]
+    fn progressive_writes_before_confirmation_emit_only_the_complete_capture() {
+        let now = Instant::now();
+        let file_only = CapturedClipboard {
+            formats: vec![RawFormat::captured(
+                "windows",
+                "CF_HDROP",
+                "CF_HDROP",
+                FormatKind::FileList,
+                vec![1; 8],
+                0,
+                true,
+            )],
+            primary_format_identity: None,
+            preview_candidate: None,
+            source_application: SourceApplication::default(),
+        };
+        let mut complete = file_only.clone();
+        complete.formats.push(RawFormat::captured(
+            "windows",
+            "CF_DIBV5",
+            "CF_DIBV5",
+            FormatKind::Image,
+            vec![2; 8],
+            1,
+            true,
+        ));
+        let mut filter = TransientClipboardFilter::new(Some(&text("原内容")));
+        assert!(filter.observe(observation(file_only, now, true)).is_empty());
+        assert!(
+            filter
+                .observe(observation(
+                    complete.clone(),
+                    now + Duration::from_millis(31),
+                    true
+                ))
+                .is_empty()
+        );
+        assert_eq!(
+            filter.take_ready(now + Duration::from_millis(31) + RESTORE_WINDOW),
+            vec![complete]
+        );
     }
 
     #[test]

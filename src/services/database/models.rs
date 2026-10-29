@@ -1,6 +1,6 @@
 pub const CURRENT_SCHEMA_VERSION: i32 = 2;
 pub const DATABASE_READ_VERSION: i32 = 1;
-pub const DATABASE_WRITE_VERSION: i32 = 2;
+pub const DATABASE_WRITE_VERSION: i32 = 1;
 pub const LIST_ORDER_GAP: i64 = 1_000_000;
 pub const LIST_ORDER_BASE: i64 = 1_024;
 

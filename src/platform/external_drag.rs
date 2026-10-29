@@ -58,6 +58,8 @@ impl Global for ExternalDragService {}
 struct ExternalDragSession {
     source_window: AnyWindowHandle,
     payloads: Vec<ClipboardPayload>,
+    /// 多选合并时 CF_HDROP 引用的临时图片，拖拽结束后转入保留池。
+    image_files: Vec<ImageTempFile>,
     preview_target: Option<NativeDragPreviewTarget>,
 }
 
@@ -93,6 +95,15 @@ impl ExternalDragService {
         payloads: Vec<ClipboardPayload>,
         cx: &mut App,
     ) -> Result<(), String> {
+        Self::begin_with_files(source_window, payloads, Vec::new(), cx)
+    }
+
+    pub(crate) fn begin_with_files(
+        source_window: AnyWindowHandle,
+        payloads: Vec<ClipboardPayload>,
+        image_files: Vec<ImageTempFile>,
+        cx: &mut App,
+    ) -> Result<(), String> {
         if payloads.is_empty() {
             return Err("没有可用于外部拖拽的剪贴板格式".to_owned());
         }
@@ -101,6 +112,7 @@ impl ExternalDragService {
             service.session = Some(ExternalDragSession {
                 source_window,
                 payloads,
+                image_files,
                 preview_target,
             });
         });
@@ -185,14 +197,18 @@ impl ExternalDragService {
                 outcome: DragDropOutcome::Finished,
                 image_temp_file,
             }) => {
-                if let Some(file) = image_temp_file {
-                    cx.update_global::<Self, _>(|service, _| {
-                        service.retained_image_files.push(RetainedImageFile {
-                            expires_at: Instant::now() + IMAGE_TEMP_FILE_RETENTION,
-                            _file: file,
-                        });
-                    });
-                }
+                let expires_at = Instant::now() + IMAGE_TEMP_FILE_RETENTION;
+                cx.update_global::<Self, _>(|service, _| {
+                    service.retained_image_files.extend(
+                        image_temp_file
+                            .into_iter()
+                            .chain(session.image_files)
+                            .map(|file| RetainedImageFile {
+                                expires_at,
+                                _file: file,
+                            }),
+                    );
+                });
                 DragPreviewService::finish(cx);
             }
             Err(error) => {

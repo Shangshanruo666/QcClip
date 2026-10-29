@@ -53,6 +53,12 @@ pub(super) const OPEN_WITH_DEFAULT_ACTION: &str = "open-with-default";
 /// 右键菜单"在浏览器中打开"单条链接的动作标识前缀，后缀为链接下标。
 pub(super) const OPEN_LINK_ACTION_PREFIX: &str = "open-link-";
 
+/// 右键菜单"贴到屏幕"的动作标识。
+pub(super) const PIN_TO_SCREEN_ACTION: &str = "pin-to-screen";
+
+/// 右键菜单“拆词”的动作标识。
+pub(super) const SPLIT_WORDS_ACTION: &str = "split-words";
+
 /// 右键菜单"全部打开"的动作标识。
 pub(super) const OPEN_ALL_LINKS_ACTION: &str = "open-all-links";
 
@@ -132,8 +138,12 @@ pub(super) fn history_item_context_menu(
             translator.translate("main.menu.copy"),
         )
         .with_icon(MenuIcon::svg("copy.svg")),
-        note_menu_item(item, translator),
+        pin_to_screen_menu_item(translator),
     ];
+    if has_editable_text(item) {
+        items.push(split_words_menu_item(translator));
+    }
+    items.push(note_menu_item(item, translator));
     if has_editable_text(item) {
         items.push(
             MenuItem::action(
@@ -203,8 +213,12 @@ pub(super) fn favorite_item_context_menu(
             translator.translate("main.menu.copy"),
         )
         .with_icon(MenuIcon::svg("copy.svg")),
-        note_menu_item(item, translator),
+        pin_to_screen_menu_item(translator),
     ];
+    if has_editable_text(item) {
+        items.push(split_words_menu_item(translator));
+    }
+    items.push(note_menu_item(item, translator));
     if has_editable_text(item) {
         items.push(
             MenuItem::action(
@@ -254,6 +268,22 @@ fn pin_menu_item(item: &ClipboardListItem, translator: &Translator) -> MenuItem 
         }),
     )
     .with_icon(MenuIcon::svg("pin.svg"))
+}
+
+fn pin_to_screen_menu_item(translator: &Translator) -> MenuItem {
+    MenuItem::action(
+        MenuActionId::new(PIN_TO_SCREEN_ACTION),
+        translator.translate("main.menu.pin_to_screen"),
+    )
+    .with_icon(MenuIcon::svg("sticker.svg"))
+}
+
+fn split_words_menu_item(translator: &Translator) -> MenuItem {
+    MenuItem::action(
+        MenuActionId::new(SPLIT_WORDS_ACTION),
+        translator.translate("main.menu.split_words"),
+    )
+    .with_icon(MenuIcon::svg("blocks.svg"))
 }
 
 fn note_menu_item(item: &ClipboardListItem, translator: &Translator) -> MenuItem {

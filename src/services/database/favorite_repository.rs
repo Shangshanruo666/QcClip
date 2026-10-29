@@ -13,7 +13,7 @@ use crate::domain::clipboard::ClipboardItemId;
 use crate::services::storage::RawBlobStore;
 
 use super::{
-    Database,
+    Database, TagRepository,
     models::{LIST_ORDER_BASE, LIST_ORDER_GAP},
     query::{
         HistoryContentFilter, HistoryListRecord, HistoryQuery, HistoryQueryError,
@@ -71,9 +71,29 @@ impl FavoriteRepository {
     }
 
     pub fn add_to_favorites(&self, item_id: ClipboardItemId) -> Result<bool, FavoriteWriteError> {
+        self.add_to_favorites_with_tags(item_id, &[])
+    }
+
+    pub fn add_to_favorites_with_tags(
+        &self,
+        item_id: ClipboardItemId,
+        tag_ids: &[i64],
+    ) -> Result<bool, FavoriteWriteError> {
         let mut connection = self.database.connect_write()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        TagRepository::append_item_tags_in_transaction(&transaction, item_id, tag_ids)?;
+        let added = Self::add_to_favorites_in_transaction(&transaction, item_id)?;
+        transaction.commit()?;
+        if added {
+            crate::services::sync::favorited(&self.database, item_id);
+        }
+        Ok(added)
+    }
 
+    pub(crate) fn add_to_favorites_in_transaction(
+        transaction: &Transaction<'_>,
+        item_id: ClipboardItemId,
+    ) -> rusqlite::Result<bool> {
         if transaction
             .query_row(
                 "SELECT 1 FROM favorites WHERE item_id = ?1",
@@ -83,7 +103,6 @@ impl FavoriteRepository {
             .optional()?
             .is_some()
         {
-            transaction.commit()?;
             return Ok(false);
         }
 
@@ -105,11 +124,7 @@ impl FavoriteRepository {
             ],
         )?;
         if inserted > 0 {
-            crate::services::sync::activity::record_local(&transaction, item_id, true)?;
-        }
-        transaction.commit()?;
-        if inserted > 0 {
-            crate::services::sync::favorited(&self.database, item_id);
+            crate::services::sync::activity::record_local(transaction, item_id, true)?;
         }
         Ok(inserted > 0)
     }

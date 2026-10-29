@@ -235,6 +235,31 @@ fn windows_monitor_for_point(point: Point<f32>) -> Option<DisplayPlacement> {
 }
 
 #[cfg(target_os = "windows")]
+pub(crate) fn display_id_for_foreground_window() -> Option<DisplayId> {
+    use windows::Win32::{
+        Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow},
+        UI::WindowsAndMessaging::GetForegroundWindow,
+    };
+
+    // SAFETY: GetForegroundWindow 只读取系统当前前台窗口句柄，不修改系统状态。
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return None;
+    }
+    // SAFETY: hwnd 是刚读取的前台窗口句柄；MonitorFromWindow 只查询其所在显示器。
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_invalid() {
+        return None;
+    }
+    Some(DisplayId::new(monitor.0 as u64))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn display_id_for_foreground_window() -> Option<DisplayId> {
+    None
+}
+
+#[cfg(target_os = "windows")]
 fn windows_work_area_for_point(point: Point<f32>) -> Option<DisplayPlacement> {
     use raw_input::Display;
     use windows::Win32::{
@@ -897,6 +922,63 @@ pub(crate) fn raise_window_to_topmost(window: &Window) -> Result<(), String> {
 
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn raise_window_to_topmost(_window: &Window) -> Result<(), String> {
+    Ok(())
+}
+
+/// 便签窗口：隐藏任务栏图标，并默认不抢占焦点，点击便签内容后仍可直接粘贴到原窗口。
+#[cfg(target_os = "windows")]
+pub(crate) fn configure_sticky_window(window: &Window, topmost: bool) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, SetWindowLongPtrW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW,
+    };
+
+    let hwnd = window_hwnd(window)?;
+    // SAFETY: hwnd 已通过 IsWindow 校验，只修改当前便签窗口的扩展样式。
+    unsafe {
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let sticky_style = (ex_style | WS_EX_TOOLWINDOW.0 as isize | WS_EX_NOACTIVATE.0 as isize)
+            & !(WS_EX_APPWINDOW.0 as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, sticky_style);
+    }
+    set_window_topmost(window, topmost)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn configure_sticky_window(_window: &Window, _topmost: bool) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn set_window_topmost(window: &Window, topmost: bool) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SetWindowPos,
+    };
+
+    let hwnd = window_hwnd(window)?;
+    let insert_after = if topmost {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+    // SAFETY: hwnd 已通过 IsWindow 校验，只切换当前窗口的置顶层级，不改变位置、尺寸和焦点。
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(insert_after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED,
+        )
+    }
+    .map_err(|error| format!("切换窗口置顶失败：{error}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn set_window_topmost(_window: &Window, _topmost: bool) -> Result<(), String> {
     Ok(())
 }
 
@@ -2501,6 +2583,8 @@ struct FramelessWindowHook {
     previous: isize,
     /// 窗口创建时是否允许缩放，用于在客户区覆盖整窗后补回边缘缩放热区。
     resizable: bool,
+    /// 临时禁止拖动边缘缩放，例如便签折叠成胶囊时。
+    resize_locked: bool,
     resizing: bool,
     resize_finished: bool,
 }
@@ -2526,6 +2610,27 @@ fn take_window_resize_finished_for_hwnd(hwnd: windows::Win32::Foundation::HWND) 
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn take_window_resize_finished(_window: &Window) -> Result<bool, String> {
     Ok(false)
+}
+
+/// 临时禁止或恢复无边框窗口的边缘缩放。
+#[cfg(target_os = "windows")]
+pub(crate) fn set_window_resize_locked(window: &Window, locked: bool) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::GetPropW;
+
+    let hwnd = window_hwnd(window)?;
+    // SAFETY: 属性由本模块安装，查询与窗口消息处理均发生在窗口线程。
+    let hook = unsafe { GetPropW(hwnd, FRAMELESS_PROC_PROP) }.0 as *mut FramelessWindowHook;
+    if hook.is_null() {
+        return Err("窗口未安装无边框处理，无法锁定缩放".to_owned());
+    }
+    // SAFETY: 窗口线程独占访问仍有效的钩子状态。
+    unsafe { (*hook).resize_locked = locked };
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn set_window_resize_locked(_window: &Window, _locked: bool) -> Result<(), String> {
+    Ok(())
 }
 
 /// 安装客户区覆盖整个窗口的消息处理。
@@ -2562,6 +2667,7 @@ fn install_frameless_client_area_hook(hwnd: windows::Win32::Foundation::HWND, re
     let hook_ptr = Box::into_raw(Box::new(FramelessWindowHook {
         previous,
         resizable,
+        resize_locked: false,
         resizing: false,
         resize_finished: false,
     }));
@@ -2619,6 +2725,19 @@ unsafe extern "system" fn frameless_window_proc(
     // `WM_NCCALCSIZE` 的 `rgrc[0]` 已是窗口矩形，返回 0 即表示客户区覆盖整个窗口。
     if message == WM_NCCALCSIZE && wparam.0 != 0 && !is_zoom_or_minimized {
         return LRESULT(0);
+    }
+
+    // SAFETY: hook 由本模块安装，窗口销毁前保持有效。
+    if message == WM_NCHITTEST && !hook.is_null() && unsafe { (*hook).resize_locked } {
+        // 锁定时把所有缩放热区当作客户区，边缘既不显示缩放光标也不能拖动。
+        let locked = ResizeEdgeRestrictions {
+            left: true,
+            right: true,
+            top: true,
+            bottom: true,
+        };
+        let result = unsafe { call_hook_previous(hook, hwnd, message, wparam, lparam) };
+        return LRESULT(filter_resize_hit_test_value(result.0, locked));
     }
 
     if message == WM_NCHITTEST

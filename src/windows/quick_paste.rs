@@ -17,8 +17,8 @@ use crate::{
 };
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, DisplayId, Global, ObjectFit, Pixels, Point, Render, RenderImage,
-    ScrollDelta, ScrollWheelEvent, SharedString, Window, WindowHandle, div, img, point, px,
+    App, Bounds, Context, DisplayId, Global, IsZero as _, ObjectFit, Pixels, Point, Render,
+    RenderImage, ScrollWheelEvent, SharedString, Window, WindowHandle, div, img, point, px,
     relative, size,
 };
 use gpui_component::{Icon, IconNamed, Sizable as _};
@@ -955,14 +955,15 @@ impl QuickPasteWindowView {
         self.apply_reveal_clip(window);
     }
 
-    fn scroll(&mut self, delta: ScrollDelta, cx: &mut Context<Self>) {
-        let direction = match delta {
-            ScrollDelta::Lines(delta) if delta.y != 0.0 => delta.y.signum() as isize,
-            ScrollDelta::Pixels(delta) if f32::from(delta.y) != 0.0 => {
-                f32::from(delta.y).signum() as isize
-            }
-            _ => return,
-        };
+    fn scroll(&mut self, event: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+        let delta = crate::ui::smooth_scroll::vertical_wheel_delta(
+            event.delta.pixel_delta(window.line_height()),
+            event.modifiers.shift,
+        );
+        if delta.is_zero() {
+            return;
+        }
+        let direction = f32::from(delta).signum() as isize;
         if self.list_ids.is_empty() {
             return;
         }
@@ -1578,7 +1579,7 @@ impl Render for QuickPasteWindowView {
                 )
                 .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, window, cx| {
                     window.prevent_default();
-                    view.scroll(event.delta, cx);
+                    view.scroll(event, window, cx);
                 }))
         } else {
             div()
@@ -1592,7 +1593,7 @@ impl Render for QuickPasteWindowView {
                 )
                 .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, window, cx| {
                     window.prevent_default();
-                    view.scroll(event.delta, cx);
+                    view.scroll(event, window, cx);
                 }))
         };
         let content = div()

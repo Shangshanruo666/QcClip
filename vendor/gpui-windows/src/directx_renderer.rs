@@ -43,6 +43,11 @@ use crate::*;
 use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
+/// Window property holding the window corner radius in physical pixels. When set to a positive
+/// value, the renderer masks the finished frame to an anti-aliased rounded rectangle, replacing
+/// GDI window regions (which are aliased) on systems without native DWM rounding.
+pub(crate) const WINDOW_CORNER_RADIUS_PROP: windows::core::PCWSTR =
+    windows::core::w!("GpuiWindowCornerRadius");
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
@@ -256,6 +261,8 @@ struct DirectXRenderPipelines {
     // (dst *= 1 - coverage, driven by an opaque 1x1 texture) followed by an additive pass.
     backdrop_blend_erase: ID3D11BlendState,
     backdrop_blend_add: ID3D11BlendState,
+    // Window corner mask: dst *= coverage, driven by the opaque texture like the erase pass.
+    window_mask_blend: ID3D11BlendState,
     opaque_texture_srv: Option<ID3D11ShaderResourceView>,
 }
 
@@ -785,6 +792,7 @@ impl DirectXRenderer {
         if use_offscreen {
             self.dx_blit(&scene_srv, &swapchain_rtv)?;
         }
+        self.apply_window_corner_mask(&swapchain_rtv)?;
         self.active_render_target = None;
         Ok(())
     }
@@ -1469,6 +1477,50 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// Clip the finished frame to the rounded window shape requested via
+    /// [`WINDOW_CORNER_RADIUS_PROP`]. Only meaningful with DirectComposition, whose premultiplied
+    /// swapchain alpha makes the masked corners transparent.
+    fn apply_window_corner_mask(&self, target_rtv: &Option<ID3D11RenderTargetView>) -> Result<()> {
+        if self.direct_composition.is_none() {
+            return Ok(());
+        }
+        use windows::Win32::UI::WindowsAndMessaging::GetPropW;
+        // SAFETY: only reads a pointer-sized integer property from the renderer's own window.
+        let radius = unsafe { GetPropW(self.hwnd, WINDOW_CORNER_RADIUS_PROP) }.0 as usize as f32;
+        if radius <= 0.0 {
+            return Ok(());
+        }
+        let size = size(ScaledPixels(self.width as f32), ScaledPixels(self.height as f32));
+        let bounds = Bounds::new(point(ScaledPixels(0.0), ScaledPixels(0.0)), size);
+        let radius = ScaledPixels(radius.min(self.width.min(self.height) as f32 / 2.0));
+        let full_vp = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .viewport;
+        self.dx_blur_pass(
+            &self.pipelines.blur_composite_vertex,
+            &self.pipelines.blur_composite_fragment,
+            &self.pipelines.window_mask_blend,
+            target_rtv,
+            &self.pipelines.opaque_texture_srv,
+            BlurUniforms::composite(
+                bounds,
+                bounds,
+                Corners::all(radius),
+                0.0,
+                1.0,
+                FilterCompositeClip::RoundedBounds,
+                [1.0, 1.0],
+                [self.width as f32, self.height as f32],
+            ),
+            &full_vp,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            4,
+            false,
+        )
+    }
+
     /// Copy the offscreen scene texture into the swapchain render target.
     fn dx_blit(
         &self,
@@ -1736,6 +1788,8 @@ impl DirectXRenderPipelines {
         )?;
         let backdrop_blend_add =
             create_blend_state_with_factors(device, D3D11_BLEND_ONE, D3D11_BLEND_ONE)?;
+        let window_mask_blend =
+            create_blend_state_with_factors(device, D3D11_BLEND_ZERO, D3D11_BLEND_SRC_ALPHA)?;
         let opaque_texture_srv = create_opaque_texture_srv(device)?;
 
         let surface = ShaderModule::Surface.bytecode()?;
@@ -1769,6 +1823,7 @@ impl DirectXRenderPipelines {
             blur_blend_composite,
             backdrop_blend_erase,
             backdrop_blend_add,
+            window_mask_blend,
             opaque_texture_srv,
         })
     }
@@ -2633,7 +2688,6 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         SmoothedPolychromeSprite,
-        EmojiRasterization,
         Surface,
         BlurDownsample,
         Blur,
@@ -2643,7 +2697,7 @@ pub(crate) mod shader_resources {
 
     impl ShaderModule {
         #[cfg(test)]
-        const ALL: [Self; 17] = [
+        const ALL: [Self; 16] = [
             Self::Quad,
             Self::SmoothedQuad,
             Self::Shadow,
@@ -2655,7 +2709,6 @@ pub(crate) mod shader_resources {
             Self::SubpixelSprite,
             Self::PolychromeSprite,
             Self::SmoothedPolychromeSprite,
-            Self::EmojiRasterization,
             Self::Surface,
             Self::BlurDownsample,
             Self::Blur,
@@ -2676,7 +2729,6 @@ pub(crate) mod shader_resources {
                 Self::SubpixelSprite => "subpixel_sprites",
                 Self::PolychromeSprite => "polychrome_sprites",
                 Self::SmoothedPolychromeSprite => "smoothed_polychrome_sprites",
-                Self::EmojiRasterization => "emoji_rasterization",
                 Self::Surface => "surfaces",
                 Self::BlurDownsample => "blur_downsample",
                 Self::Blur => "blur",
@@ -3183,6 +3235,48 @@ mod tests {
         expect("polychrome sprite", 55, 65, [255, 0, 0]);
         expect("second quad batch", 85, 85, [0, 0, 255]);
         expect("background", 190, 20, [255, 255, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn window_corner_radius_masks_the_frame_with_antialiased_corners() -> Result<()> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::UI::WindowsAndMessaging::{RemovePropW, SetPropW};
+
+        let window = HiddenWindow::new()?;
+        let devices = DirectXDevices::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, false)?;
+        renderer.resize(Size {
+            width: DevicePixels(200),
+            height: DevicePixels(100),
+        })?;
+        let mut scene = Scene::default();
+        scene.finish();
+
+        let unmasked = renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+        assert_eq!(unmasked.get_pixel(0, 0).0, [255; 4]);
+
+        unsafe {
+            SetPropW(
+                window.0,
+                super::WINDOW_CORNER_RADIUS_PROP,
+                Some(HANDLE(16usize as *mut _)),
+            )?
+        };
+        let masked = renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+        unsafe { RemovePropW(window.0, super::WINDOW_CORNER_RADIUS_PROP) }.ok();
+
+        for (x, y) in [(0, 0), (199, 0), (0, 99), (199, 99)] {
+            assert_eq!(masked.get_pixel(x, y).0, [0; 4], "corner ({x},{y})");
+        }
+        assert_eq!(masked.get_pixel(100, 50).0, [255; 4]);
+        assert_eq!(masked.get_pixel(100, 0).0, [255; 4]);
+        // Pixels crossing the arc keep partial, premultiplied coverage instead of a hard step.
+        let edge = (0..16)
+            .map(|i| masked.get_pixel(i, i).0)
+            .find(|pixel| pixel[3] > 0 && pixel[3] < 255)
+            .expect("corner arc must be antialiased");
+        assert!(edge[0] == edge[3] && edge[1] == edge[3] && edge[2] == edge[3]);
         Ok(())
     }
 }

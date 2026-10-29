@@ -63,42 +63,30 @@ pub(super) fn set_decorations_visible(
     native::set_decorations_visible(hwnd, visible)
 }
 
+/// 旧系统没有 DWM 原生圆角。GDI 窗口区域只能按整像素裁剪，边缘会有锯齿，
+/// 因此改由 GPUI 渲染器在每帧末尾按圆角矩形做抗锯齿透明遮罩。
 #[cfg(target_os = "windows")]
 mod native {
     use super::{FrameStyle, WindowMaterial, frame_policy};
     use windows::Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
-        Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn},
+        Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM},
+        Graphics::Gdi::InvalidateRect,
         UI::{
             HiDpi::GetDpiForWindow,
             Shell::{DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::{
-                GetWindowRect, IsIconic, IsZoomed, WM_DPICHANGED, WM_NCDESTROY, WM_SIZE,
+                IsIconic, IsZoomed, RemovePropW, SetPropW, WM_DPICHANGED, WM_NCDESTROY, WM_SIZE,
                 WM_WINDOWPOSCHANGED,
             },
         },
     };
 
     const SUBCLASS_ID: usize = 1;
+    /// 与 vendor/gpui-windows 渲染器约定的窗口属性，值为物理像素圆角半径。
+    const CORNER_RADIUS_PROP: windows::core::PCWSTR = windows::core::w!("GpuiWindowCornerRadius");
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct RoundedRegion {
-        width: i32,
-        height: i32,
-        diameter: i32,
-    }
-
-    impl RoundedRegion {
-        fn new(width: i32, height: i32, dpi: u32) -> Self {
-            let width = width.max(1);
-            let height = height.max(1);
-            let diameter = (super::CORNER_RADIUS * 2.0 * dpi.max(96) as f32 / 96.0).round() as i32;
-            Self {
-                width,
-                height,
-                diameter: diameter.min(width).min(height),
-            }
-        }
+    fn physical_radius(dpi: u32) -> usize {
+        (super::CORNER_RADIUS * dpi.max(96) as f32 / 96.0).round() as usize
     }
 
     #[derive(Clone, Copy)]
@@ -106,8 +94,7 @@ mod native {
         material: WindowMaterial,
         decorations_visible: bool,
         fullscreen: bool,
-        region: Option<RoundedRegion>,
-        updating: bool,
+        radius: usize,
         rounding_failed: bool,
     }
 
@@ -126,8 +113,7 @@ mod native {
             material,
             decorations_visible: true,
             fullscreen,
-            region: None,
-            updating: false,
+            radius: 0,
             rounding_failed: false,
         }));
         // SAFETY: 状态地址保持稳定，由 WM_NCDESTROY 回收；子类仅处理当前线程的窗口。
@@ -164,7 +150,7 @@ mod native {
 
     pub(super) fn set_decorations_visible(hwnd: HWND, visible: bool) -> Result<(), String> {
         if let Some(data) = state(hwnd) {
-            // SAFETY: 仅在窗口线程修改仍有效的状态，随后才调用可能重入的系统接口。
+            // SAFETY: 仅在窗口线程修改仍有效的状态，随后才调用系统接口。
             unsafe { (*data).decorations_visible = visible };
             refresh(hwnd)?;
         }
@@ -211,90 +197,53 @@ mod native {
         let Some(data) = state(hwnd) else {
             return Ok(());
         };
-        // SAFETY: 只复制当前窗口线程的有效状态，不跨系统调用持有引用。
-        let snapshot = unsafe { *data };
         // SAFETY: 仅读取当前窗口是否处于最小化状态。
-        if snapshot.updating || unsafe { IsIconic(hwnd).as_bool() } {
+        if unsafe { IsIconic(hwnd).as_bool() } {
             return Ok(());
         }
         let target = if current_style(hwnd).is_some_and(|style| style.corner_radius > 0.0) {
-            let mut rect = RECT::default();
-            // SAFETY: rect 是有效的栈上结构，窗口区域坐标以整个窗口左上角为原点。
-            unsafe { GetWindowRect(hwnd, &mut rect) }
-                .map_err(|error| format!("读取窗口圆角区域尺寸失败：{error}"))?;
             // SAFETY: hwnd 来自当前窗口，仅读取其物理 DPI。
-            let dpi = unsafe { GetDpiForWindow(hwnd) };
-            Some(RoundedRegion::new(
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                dpi,
-            ))
+            physical_radius(unsafe { GetDpiForWindow(hwnd) })
         } else {
-            None
+            0
         };
-        if target == snapshot.region {
+        // SAFETY: 当前窗口线程独占状态；设置窗口属性不会同步派发窗口消息。
+        if unsafe { (*data).radius } == target {
             return Ok(());
         }
-
-        // SetWindowRgn 会同步触发位置消息；必须在调用前阻止重入更新。
-        // SAFETY: 当前窗口线程独占状态，赋值期间没有窗口消息调用。
-        unsafe { (*data).updating = true };
-        let result = set_region(hwnd, target);
-        let actual_region = if result.is_err() && target.is_some() {
-            // 创建或应用圆角失败后移除旧区域，避免旧尺寸继续截断窗口内容。
-            if snapshot.region.is_some() {
-                set_region(hwnd, None).map(|_| None)
+        let result = set_radius(hwnd, target);
+        // SAFETY: 同上，期间没有可能重入的窗口消息。
+        unsafe {
+            if result.is_ok() {
+                (*data).radius = target;
             } else {
-                Ok(None)
-            }
-        } else {
-            result.as_ref().map(|_| target).map_err(Clone::clone)
-        };
-        if let Some(data) = state(hwnd) {
-            // SAFETY: 系统调用后重新查询状态，避免窗口销毁后使用旧地址。
-            unsafe {
-                (*data).updating = false;
-                (*data).rounding_failed |= result.is_err() && target.is_some();
-                if let Ok(region) = actual_region.as_ref() {
-                    (*data).region = *region;
+                // 设置失败时边框回退直角，并尽量清除旧半径，避免遮罩与边框不一致。
+                (*data).rounding_failed = true;
+                if set_radius(hwnd, 0).is_ok() {
+                    (*data).radius = 0;
                 }
             }
+            // 遮罩在渲染阶段生效，请求重绘让新半径立即体现。
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
-        actual_region?;
         result
     }
 
-    fn set_region(hwnd: HWND, region: Option<RoundedRegion>) -> Result<(), String> {
-        let handle = if let Some(region) = region {
-            // SAFETY: 区域尺寸为正，直径已限制在窗口尺寸内，坐标相对整个窗口。
-            let handle = unsafe {
-                CreateRoundRectRgn(
-                    0,
-                    0,
-                    region.width.saturating_add(1),
-                    region.height.saturating_add(1),
-                    region.diameter,
-                    region.diameter,
-                )
-            };
-            if handle.is_invalid() {
-                return Err("创建窗口圆角区域失败，已回退直角边框".to_owned());
-            }
-            Some(handle)
-        } else {
-            None
-        };
-        // SAFETY: 成功后区域所有权交给系统；None 用于清除本模块设置的裁剪。
-        if unsafe { SetWindowRgn(hwnd, handle, true) } == 0 {
-            if let Some(handle) = handle {
-                // SAFETY: 设置失败时区域仍归调用方所有，必须主动释放。
-                unsafe {
-                    let _ = DeleteObject(handle.into());
-                }
-            }
-            return Err("更新窗口圆角区域失败".to_owned());
+    fn set_radius(hwnd: HWND, radius: usize) -> Result<(), String> {
+        if radius == 0 {
+            // SAFETY: 移除本模块设置的整数属性，属性不存在时无副作用。
+            let _ = unsafe { RemovePropW(hwnd, CORNER_RADIUS_PROP) };
+            return Ok(());
         }
-        Ok(())
+        // SAFETY: 属性只保存整数值而非指针，窗口销毁时由 WM_NCDESTROY 移除。
+        unsafe {
+            SetPropW(
+                hwnd,
+                CORNER_RADIUS_PROP,
+                Some(HANDLE(radius as *mut std::ffi::c_void)),
+            )
+        }
+        .map_err(|error| format!("更新窗口圆角失败：{error}"))
     }
 
     unsafe extern "system" fn window_proc(
@@ -308,12 +257,13 @@ mod native {
         if message == WM_NCDESTROY {
             // SAFETY: 状态由 install 分配，仅在移除子类后回收一次。
             unsafe {
+                let _ = RemovePropW(hwnd, CORNER_RADIUS_PROP);
                 let _ = RemoveWindowSubclass(hwnd, Some(window_proc), subclass_id);
                 drop(Box::from_raw(data as *mut AppearanceState));
                 return DefSubclassProc(hwnd, message, wparam, lparam);
             }
         }
-        // SAFETY: 原样转发消息，待 GPUI 和已有窗口钩子更新尺寸及 DPI 后再更新裁剪。
+        // SAFETY: 原样转发消息，待 GPUI 和已有窗口钩子更新尺寸及 DPI 后再同步圆角。
         let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
         if matches!(message, WM_SIZE | WM_WINDOWPOSCHANGED | WM_DPICHANGED)
             && let Err(error) = refresh(hwnd)
@@ -326,12 +276,8 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use windows::Win32::{
-            Graphics::Gdi::{CreateRectRgn, GetWindowRgn, PtInRegion},
-            UI::WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
-                WS_POPUP,
-            },
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetPropW, SW_MAXIMIZE, SW_RESTORE, ShowWindow, WS_POPUP,
         };
 
         struct TestWindow(HWND);
@@ -358,20 +304,14 @@ mod native {
                 })
             }
 
-            fn region_contains(&self, x: i32, y: i32) -> bool {
-                // SAFETY: 创建查询结果的接收区域，始终由本函数释放。
-                unsafe {
-                    let region = CreateRectRgn(0, 0, 0, 0);
-                    assert!(!region.is_invalid());
-                    let kind = GetWindowRgn(self.0, region);
-                    let contains = kind.0 != 0 && PtInRegion(region, x, y).as_bool();
-                    let _ = DeleteObject(region.into());
-                    contains
-                }
+            fn radius(&self) -> usize {
+                // SAFETY: 只读取本测试窗口的整数属性。
+                unsafe { GetPropW(self.0, CORNER_RADIUS_PROP) }.0 as usize
             }
 
-            fn has_rounded_region(&self) -> bool {
-                self.region_contains(160, 100) && !self.region_contains(0, 0)
+            fn is_rounded(&self) -> bool {
+                // SAFETY: hwnd 是当前测试线程创建的有效窗口。
+                self.radius() == physical_radius(unsafe { GetDpiForWindow(self.0) })
             }
         }
 
@@ -383,7 +323,7 @@ mod native {
         }
 
         #[test]
-        fn native_material_switches_remove_and_restore_the_window_region() {
+        fn native_material_switches_remove_and_restore_the_corner_radius() {
             let window = TestWindow::new();
             for material in [
                 WindowMaterial::Disabled,
@@ -391,71 +331,62 @@ mod native {
                 WindowMaterial::CustomImage,
             ] {
                 apply_to_hwnd(window.0, material, false).unwrap();
-                assert!(window.has_rounded_region());
+                assert!(window.is_rounded());
                 for system_material in [WindowMaterial::Acrylic, WindowMaterial::Blur] {
                     apply_to_hwnd(window.0, system_material, false).unwrap();
-                    assert!(!window.has_rounded_region());
-                    assert!(!window.region_contains(160, 100));
+                    assert_eq!(window.radius(), 0);
                     assert_eq!(current_style(window.0).unwrap().corner_radius, 0.0);
                     apply_to_hwnd(window.0, material, false).unwrap();
-                    assert!(window.has_rounded_region());
+                    assert!(window.is_rounded());
                 }
             }
         }
 
         #[test]
-        fn resizing_and_visibility_changes_keep_the_region_in_sync() {
+        fn maximize_and_visibility_changes_keep_the_radius_in_sync() {
             let window = TestWindow::new();
             apply_to_hwnd(window.0, WindowMaterial::Disabled, false).unwrap();
-            // SAFETY: 只改变本测试窗口尺寸，验证同步位置消息会更新区域。
+            assert!(window.is_rounded());
+            // SAFETY: 只改变本测试窗口的显示状态，验证同步位置消息会更新圆角。
             unsafe {
-                SetWindowPos(
-                    window.0,
-                    None,
-                    0,
-                    0,
-                    480,
-                    300,
-                    SWP_NOACTIVATE | SWP_NOZORDER,
-                )
-                .expect("调整测试窗口尺寸失败");
+                let _ = ShowWindow(window.0, SW_MAXIMIZE);
             }
-            // SAFETY: 子类状态仍由当前测试线程拥有。
-            let region = unsafe { (*state(window.0).unwrap()).region.unwrap() };
-            assert_eq!((region.width, region.height), (480, 300));
-            assert!(window.region_contains(479, 150));
-            assert!(!window.region_contains(480, 300));
+            assert_eq!(window.radius(), 0);
+            // SAFETY: 同上。
+            unsafe {
+                let _ = ShowWindow(window.0, SW_RESTORE);
+            }
+            assert!(window.is_rounded());
             set_decorations_visible(window.0, false).unwrap();
-            assert!(!window.has_rounded_region());
+            assert_eq!(window.radius(), 0);
             assert!(current_style(window.0).is_none());
             set_decorations_visible(window.0, true).unwrap();
-            assert!(window.has_rounded_region());
+            assert!(window.is_rounded());
             apply_to_hwnd(window.0, WindowMaterial::Blur, false).unwrap();
             set_decorations_visible(window.0, false).unwrap();
             set_decorations_visible(window.0, true).unwrap();
-            assert!(!window.has_rounded_region());
+            assert_eq!(window.radius(), 0);
             assert_eq!(current_style(window.0).unwrap().corner_radius, 0.0);
         }
 
         #[test]
-        fn fullscreen_clears_the_region_until_restored() {
+        fn fullscreen_clears_the_radius_until_restored() {
             let window = TestWindow::new();
             apply_to_hwnd(window.0, WindowMaterial::Disabled, false).unwrap();
-            assert!(window.has_rounded_region());
+            assert!(window.is_rounded());
             apply_to_hwnd(window.0, WindowMaterial::Disabled, true).unwrap();
-            assert!(!window.has_rounded_region());
-            assert!(!window.region_contains(160, 100));
+            assert_eq!(window.radius(), 0);
             assert!(current_style(window.0).is_none());
             apply_to_hwnd(window.0, WindowMaterial::Disabled, false).unwrap();
-            assert!(window.has_rounded_region());
+            assert!(window.is_rounded());
         }
 
         #[test]
-        fn rounded_region_scales_with_dpi_and_fits_small_windows() {
-            assert_eq!(RoundedRegion::new(320, 200, 96).diameter, 16);
-            assert_eq!(RoundedRegion::new(320, 200, 144).diameter, 24);
-            assert_eq!(RoundedRegion::new(320, 200, 192).diameter, 32);
-            assert_eq!(RoundedRegion::new(4, 1, 192).diameter, 1);
+        fn corner_radius_scales_with_dpi() {
+            assert_eq!(physical_radius(96), 8);
+            assert_eq!(physical_radius(144), 12);
+            assert_eq!(physical_radius(192), 16);
+            assert_eq!(physical_radius(0), 8);
         }
     }
 }

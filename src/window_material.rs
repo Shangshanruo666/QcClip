@@ -138,6 +138,12 @@ pub(crate) fn window_frame() -> impl IntoElement {
 }
 
 pub(crate) fn background_element(_window: &Window, cx: &App) -> gpui::AnyElement {
+    tinted_background_element(None, cx)
+}
+
+/// 窗口材质背景层；`tint` 指定主遮罩的色相（如便签颜色），为空时使用主题背景色。
+/// 遮罩透明度始终跟随全局材质不透明度。
+pub(crate) fn tinted_background_element(tint: Option<Hsla>, cx: &App) -> gpui::AnyElement {
     let background = backdrop_element(cx);
     let appearance = crate::config_runtime::appearance_config(cx);
     if supported_material(appearance.window_material) == WindowMaterial::Disabled {
@@ -147,7 +153,7 @@ pub(crate) fn background_element(_window: &Window, cx: &App) -> gpui::AnyElement
     let base = excluded_window_theme(cx);
     let tint = material_tint_color(
         base.background,
-        cx.theme().background,
+        tint.unwrap_or(cx.theme().background),
         appearance.window_material_opacity,
     );
     div()
@@ -388,7 +394,7 @@ fn apply_to_window(window: &Window, cx: &mut App) {
         1.0
     };
     let system_material = matches!(material, WindowMaterial::Acrylic | WindowMaterial::Blur);
-    // 先移除旧系统的区域圆角，再启用系统材质，避免圆角外出现材质残留。
+    // 先移除旧系统的圆角遮罩，再启用系统材质，避免圆角外出现材质残留。
     if system_material
         && let Err(error) = crate::platform::window_appearance::apply(window, material)
     {

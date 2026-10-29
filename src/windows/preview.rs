@@ -34,7 +34,6 @@ use crate::{
     ui::{fonts::AppFontMetrics, html as html_preview, icon},
 };
 
-const HOVER_DELAY: Duration = Duration::from_millis(200);
 const PREVIEW_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const PREVIEW_MAIN_GAP: f32 = 18.0;
 const PREVIEW_OFFSET: f32 = 14.0;
@@ -206,7 +205,7 @@ impl PreviewFileEntry {
     }
 }
 
-fn render_file_icon(icon: Icon) -> Option<Arc<RenderImage>> {
+pub(crate) fn render_file_icon(icon: Icon) -> Option<Arc<RenderImage>> {
     let pixels = usize::try_from(icon.width)
         .ok()?
         .checked_mul(usize::try_from(icon.height).ok()?)?
@@ -317,12 +316,14 @@ impl PreviewWindowService {
         {
             anchor = anchor.with_pointer(pointer);
         }
+        let hover_delay =
+            Duration::from_millis(u64::from(crate::config_runtime::hover_preview_delay_ms(cx)));
         cx.update_global::<Self, _>(|service, cx| {
             service.idle_destroy_task = None;
             service.generation = service.generation.wrapping_add(1);
             let generation = service.generation;
             service.pending_show = Some(cx.spawn(async move |cx| {
-                cx.background_executor().timer(HOVER_DELAY).await;
+                cx.background_executor().timer(hover_delay).await;
                 cx.update(|cx| {
                     cx.update_global::<Self, _>(|service, cx| {
                         if service.generation == generation {
@@ -1739,7 +1740,7 @@ impl Drop for PreviewWindow {
 
 impl Render for PreviewWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rem_size = crate::ui::scale::standalone_rem_size(16.0, cx);
+        let rem_size = crate::ui::scale::preview_rem_size(16.0, cx);
         if window.rem_size() != rem_size {
             self.text_wrap_width = None;
             self.content_size = None;
@@ -3064,7 +3065,10 @@ trait ScrollWheelDelta {
 
 impl ScrollWheelDelta for ScrollWheelEvent {
     fn delta_y(&self, line_height: Pixels) -> f32 {
-        f32::from(self.delta.pixel_delta(line_height).y)
+        f32::from(crate::ui::smooth_scroll::vertical_wheel_delta(
+            self.delta.pixel_delta(line_height),
+            self.modifiers.shift,
+        ))
     }
 }
 

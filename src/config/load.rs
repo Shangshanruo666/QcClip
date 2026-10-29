@@ -473,6 +473,13 @@ fn read_appearance(object: &Map<String, Value>, warnings: &mut Vec<String>) -> A
             default.preview_information,
             warnings,
         ),
+        preview_scale_percent: read_field(
+            object,
+            "previewScalePercent",
+            "appearance.previewScalePercent",
+            default.preview_scale_percent,
+            warnings,
+        ),
         item_display: read_group(object, "itemDisplay", warnings, |object, warnings| {
             let default = super::ItemDisplayConfig::default();
             super::ItemDisplayConfig {
@@ -562,6 +569,13 @@ fn read_clipboard(object: &Map<String, Value>, warnings: &mut Vec<String>) -> Cl
             default.hover_preview_enabled,
             warnings,
         ),
+        hover_preview_delay_ms: read_field(
+            object,
+            "hoverPreviewDelayMs",
+            "clipboard.hoverPreviewDelayMs",
+            default.hover_preview_delay_ms,
+            warnings,
+        ),
         heat_scrollbar_enabled: read_field(
             object,
             "heatScrollbarEnabled",
@@ -609,6 +623,13 @@ fn read_clipboard(object: &Map<String, Value>, warnings: &mut Vec<String>) -> Cl
             "movePastedToFirstInFavorites",
             "clipboard.movePastedToFirstInFavorites",
             default.move_pasted_to_first_in_favorites,
+            warnings,
+        ),
+        formatted_paste: read_field(
+            object,
+            "formattedPaste",
+            "clipboard.formattedPaste",
+            default.formatted_paste,
             warnings,
         ),
         auto_scroll_to_top: read_field(
@@ -833,6 +854,13 @@ fn read_shortcuts(object: &Map<String, Value>, warnings: &mut Vec<String>) -> Sh
             default.toggle_clipboard_monitor.clone(),
             warnings,
         ),
+        toggle_formatted_paste: read_field(
+            object,
+            "toggleFormattedPaste",
+            "shortcuts.toggleFormattedPaste",
+            default.toggle_formatted_paste.clone(),
+            warnings,
+        ),
         upload_latest: read_field(
             object,
             "uploadLatest",
@@ -859,6 +887,20 @@ fn read_shortcuts(object: &Map<String, Value>, warnings: &mut Vec<String>) -> Sh
             "quickPaste",
             "shortcuts.quickPaste",
             default.quick_paste.clone(),
+            warnings,
+        ),
+        add_favorite: read_field(
+            object,
+            "addFavorite",
+            "shortcuts.addFavorite",
+            default.add_favorite.clone(),
+            warnings,
+        ),
+        add_favorite_open_editor_on_empty: read_field(
+            object,
+            "addFavoriteOpenEditorOnEmpty",
+            "shortcuts.addFavoriteOpenEditorOnEmpty",
+            default.add_favorite_open_editor_on_empty,
             warnings,
         ),
         quick_paste_1_to_9: read_field(
@@ -926,6 +968,18 @@ fn read_shortcuts(object: &Map<String, Value>, warnings: &mut Vec<String>) -> Sh
         toggle_pinned: read_session_shortcut(
             object,
             SessionShortcutId::TogglePinned,
+            &default,
+            warnings,
+        ),
+        pin_to_screen: read_session_shortcut(
+            object,
+            SessionShortcutId::PinToScreen,
+            &default,
+            warnings,
+        ),
+        split_words: read_session_shortcut(
+            object,
+            SessionShortcutId::SplitWords,
             &default,
             warnings,
         ),
@@ -1181,6 +1235,7 @@ mod tests {
         let loaded = from_str("{}").expect("空配置对象应当可以加载");
 
         assert!(!loaded.config.clipboard.clear_tags_on_tab_switch);
+        assert!(loaded.config.clipboard.formatted_paste);
         assert_eq!(loaded.config.general.language, InterfaceLanguage::ZhCn);
         assert!(loaded.config.general.global_notification_enabled);
         assert_eq!(
@@ -1300,6 +1355,29 @@ mod tests {
             from_str(&json).expect("无法重新加载缩放配置").config,
             default.config
         );
+    }
+
+    #[test]
+    fn preview_scale_defaults_loads_and_stacks_on_ui_scale() {
+        let default = from_str(r#"{"appearance":{"mode":"dark"}}"#).expect("无法加载旧配置");
+        assert_eq!(default.config.appearance.preview_scale_percent, 100);
+        for (input, expected) in [(0, 80), (150, 150), (65535, 200)] {
+            let loaded = from_str(&format!(
+                r#"{{"appearance":{{"previewScalePercent":{input}}}}}"#
+            ))
+            .expect("无法加载预览缩放配置");
+            assert_eq!(loaded.config.appearance.preview_scale_percent, expected);
+        }
+        let stacked =
+            from_str(r#"{"appearance":{"uiScalePercent":150,"previewScalePercent":120}}"#)
+                .expect("无法加载叠加缩放配置");
+        assert!((stacked.config.appearance.preview_scale() - 1.8).abs() < 0.001);
+        let invalid =
+            from_str(r#"{"appearance":{"previewScalePercent":"大","uiScalePercent":125}}"#)
+                .expect("无法加载字段级容错配置");
+        assert_eq!(invalid.config.appearance.preview_scale_percent, 100);
+        assert_eq!(invalid.config.appearance.ui_scale_percent, 125);
+        assert_eq!(invalid.warnings.len(), 1);
     }
 
     #[test]
@@ -1631,6 +1709,50 @@ mod tests {
                 key: "h".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn add_favorite_shortcut_is_loaded_from_shortcuts_config() {
+        let loaded = from_str(
+            r#"{
+                "shortcuts": {
+                    "addFavorite": {
+                        "control": true,
+                        "alt": true,
+                        "shift": false,
+                        "platform": false,
+                        "key": "j"
+                    }
+                }
+            }"#,
+        )
+        .expect("快捷收藏快捷键应当可以加载");
+
+        assert_eq!(
+            loaded.config.shortcuts.add_favorite,
+            Some(ShortcutBinding {
+                control: true,
+                alt: true,
+                shift: false,
+                platform: false,
+                key: "j".to_owned(),
+            })
+        );
+        let saved = serde_json::to_value(&loaded.config).expect("配置应当可以序列化");
+        assert_eq!(saved["shortcuts"]["addFavorite"]["key"], "j");
+    }
+
+    #[test]
+    fn add_favorite_open_editor_on_empty_defaults_true_and_loads_false() {
+        let default = from_str("{}").expect("空配置应当可以加载");
+        assert!(default.config.shortcuts.add_favorite_open_editor_on_empty);
+
+        let loaded = from_str(r#"{"shortcuts":{"addFavoriteOpenEditorOnEmpty":false}}"#)
+            .expect("快捷收藏编辑器开关应当可以加载");
+        assert!(!loaded.config.shortcuts.add_favorite_open_editor_on_empty);
+
+        let saved = serde_json::to_value(&loaded.config).expect("配置应当可以序列化");
+        assert_eq!(saved["shortcuts"]["addFavoriteOpenEditorOnEmpty"], false);
     }
 
     #[test]

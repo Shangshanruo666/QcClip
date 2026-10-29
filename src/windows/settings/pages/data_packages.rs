@@ -1017,6 +1017,7 @@ fn apply(panel: Entity<PackagePanel>, cx: &mut App) {
     if !begin(&panel, true, cx) {
         return;
     }
+    crate::services::quick_favorite::QuickFavoriteService::suspend(cx);
     MainWindowService::stop_clipboard_listener(cx);
     cx.spawn(async move |cx| {
         let result = cx
@@ -1052,6 +1053,7 @@ fn apply(panel: Entity<PackagePanel>, cx: &mut App) {
                     Err(error.to_string())
                 }
             };
+            crate::services::quick_favorite::QuickFavoriteService::resume(cx);
             finish(&panel, true, result, Some("package.import_success"), cx);
         });
     })

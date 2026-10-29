@@ -95,6 +95,7 @@ impl ApplicationFilterService {
     }
 
     fn handle_foreground(window: isize, cx: &mut App) {
+        crate::services::focus::record_foreground_window(window);
         #[cfg(target_os = "windows")]
         let application = application_for_window(window);
         #[cfg(not(target_os = "windows"))]

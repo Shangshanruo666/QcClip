@@ -116,6 +116,19 @@ impl TagRepository {
             .map_err(TagQueryError::from)
     }
 
+    pub fn item_tag_ids(&self, item_id: ClipboardItemId) -> Result<Vec<i64>, TagQueryError> {
+        let connection = self.database.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT tag_id
+             FROM clipboard_item_tags
+             WHERE item_id = ?1
+             ORDER BY tag_id",
+        )?;
+        let rows = statement.query_map([item_id], |row| row.get::<_, i64>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(TagQueryError::from)
+    }
+
     pub fn create(&self, name: &str, color: &str) -> Result<Tag, TagCreateError> {
         let name = validate_name(name).map_err(|error| match error {
             NameError::Empty => TagCreateError::EmptyName,
@@ -301,16 +314,28 @@ impl TagRepository {
     ) -> Result<bool, TagItemWriteError> {
         let mut connection = self.database.connect_write()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let timestamp = current_timestamp_millis();
-        let inserted = transaction.execute(
-            "INSERT INTO clipboard_item_tags (
-                uuid, item_id, tag_id, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(item_id, tag_id) DO NOTHING",
-            params![Uuid::new_v4().to_string(), item_id, tag_id, timestamp],
-        )?;
+        let inserted = Self::append_item_tags_in_transaction(&transaction, item_id, &[tag_id])?;
         transaction.commit()?;
         Ok(inserted > 0)
+    }
+
+    pub(crate) fn append_item_tags_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        item_id: ClipboardItemId,
+        tag_ids: &[i64],
+    ) -> rusqlite::Result<usize> {
+        let timestamp = current_timestamp_millis();
+        let mut inserted = 0;
+        for tag_id in tag_ids {
+            inserted += transaction.execute(
+                "INSERT INTO clipboard_item_tags (
+                    uuid, item_id, tag_id, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(item_id, tag_id) DO NOTHING",
+                params![Uuid::new_v4().to_string(), item_id, tag_id, timestamp],
+            )?;
+        }
+        Ok(inserted)
     }
 
     pub fn remove_from_item(
@@ -627,6 +652,60 @@ mod tests {
             )
             .expect("无法验证标签删除结果");
         assert_eq!(counts, (0, 1));
+    }
+
+    #[test]
+    fn item_tag_ids_returns_sorted_unique_tag_ids() {
+        let directory = tempfile::tempdir().expect("无法创建测试临时目录");
+        let database =
+            Database::open(directory.path().join("test.sqlite3")).expect("无法创建测试数据库");
+        let repository = TagRepository::new(database.clone());
+        let first = repository
+            .create("工作", "#1677FF")
+            .expect("无法创建第一个测试标签");
+        let second = repository
+            .create("开发", "#00FF00")
+            .expect("无法创建第二个测试标签");
+        let connection = database.connect().expect("无法连接测试数据库");
+        connection
+            .execute(
+                "INSERT INTO clipboard_items (
+                    uuid, hash_version, content_hash, content_kind, capture_state,
+                    created_at, updated_at
+                 ) VALUES ('item-tag-query', 1, zeroblob(32), 'text', 'pending', 1, 1)",
+                [],
+            )
+            .expect("无法创建测试内容");
+        let item_id = connection.last_insert_rowid();
+
+        assert_eq!(
+            repository.item_tag_ids(item_id).expect("无法查询空标签"),
+            Vec::<i64>::new()
+        );
+        assert!(
+            repository
+                .add_to_item(item_id, second.id)
+                .expect("无法添加第二个标签")
+        );
+        assert!(
+            repository
+                .add_to_item(item_id, first.id)
+                .expect("无法添加第一个标签")
+        );
+        assert!(
+            !repository
+                .add_to_item(item_id, first.id)
+                .expect("无法重复添加标签")
+        );
+
+        assert_eq!(
+            repository.item_tag_ids(item_id).expect("无法查询标签"),
+            {
+                let mut expected = vec![first.id, second.id];
+                expected.sort_unstable();
+                expected
+            }
+        );
     }
 
     #[test]

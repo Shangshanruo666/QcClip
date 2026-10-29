@@ -74,6 +74,8 @@ pub(super) fn open_item_display_sheet(
                 display.actions_visibility,
                 vec![
                     ItemDisplayField::Edit,
+                    ItemDisplayField::PinToScreen,
+                    ItemDisplayField::SplitWords,
                     ItemDisplayField::Note,
                     ItemDisplayField::PastePlain,
                     ItemDisplayField::OpenDefault,

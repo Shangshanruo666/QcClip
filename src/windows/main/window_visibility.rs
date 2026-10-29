@@ -1118,6 +1118,12 @@ fn apply_visibility_animation_frame(
                 frame_bounds.left,
                 frame_bounds.top,
             )?;
+            // 从隐藏位置滑入另一块显示器时，DPI 变化发生在动画中途：WM_DPICHANGED
+            // 会按系统建议矩形缩放窗口，而仅移动位置的动画帧不会恢复尺寸，需按目标边界校正。
+            if platform_window::physical_client_bounds(window)? != frame_bounds {
+                platform_window::set_client_bounds(window, frame_bounds)?;
+                window.bounds_changed(cx);
+            }
             if completed && !show {
                 platform_window::set_window_shadow_visible(window, false)?;
                 if hide_window {

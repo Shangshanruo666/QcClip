@@ -38,6 +38,20 @@ const SETTINGS_LINE_HEIGHT_SELECTOR_WIDTH: f32 = 360.0;
 const SETTINGS_SOUND_SLIDER_WIDTH: f32 = 220.0;
 const SETTINGS_SEARCH_HIGHLIGHT_DURATION_MS: u64 = 2600;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortcutRecordingTarget {
+    ToggleMainWindow,
+    OpenSettings,
+    ToggleClipboardMonitor,
+    ToggleFormattedPaste,
+    UploadLatest,
+    PullLatest,
+    PlainTextPaste,
+    QuickPaste,
+    AddFavorite,
+    Session(crate::config::SessionShortcutId),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum DataStatsScope {
     #[default]
@@ -373,10 +387,16 @@ fn notify_settings_error(
     notify_settings_status(page, error, NotificationLevel::Error, cx)
 }
 
+const TAB_BAR_HOVER_DELAY_RANGE: (u16, u16) = (
+    ClipboardConfig::TAB_BAR_HOVER_DELAY_MIN_MS,
+    ClipboardConfig::TAB_BAR_HOVER_DELAY_MAX_MS,
+);
+
 fn clipboard_hover_delay_subscription(
     slider: &Entity<SliderState>,
     window: &mut Window,
     cx: &mut Context<SettingsWindowView>,
+    range: (u16, u16),
     apply: fn(&mut ClipboardConfig, u16),
 ) -> Subscription {
     cx.subscribe_in(
@@ -386,10 +406,10 @@ fn clipboard_hover_delay_subscription(
             let SliderEvent::Change(value) = event else {
                 return;
             };
-            let delay = value.end().round().clamp(
-                f32::from(ClipboardConfig::TAB_BAR_HOVER_DELAY_MIN_MS),
-                f32::from(ClipboardConfig::TAB_BAR_HOVER_DELAY_MAX_MS),
-            ) as u16;
+            let delay = value
+                .end()
+                .round()
+                .clamp(f32::from(range.0), f32::from(range.1)) as u16;
             let current = config_runtime::clipboard_config(cx);
             let mut clipboard = current.clone();
             apply(&mut clipboard, delay);
@@ -605,6 +625,18 @@ fn search_target_specs() -> &'static [SearchTargetSpec] {
         },
         SearchTargetSpec {
             page: ListPreview,
+            title_key: "settings.clipboard.hover_preview_delay",
+            description_key: Some("settings.clipboard.hover_preview_delay_description"),
+            ratio: 0.78,
+        },
+        SearchTargetSpec {
+            page: ListPreview,
+            title_key: "settings.personalization.preview_scale",
+            description_key: Some("settings.personalization.preview_scale_description"),
+            ratio: 0.80,
+        },
+        SearchTargetSpec {
+            page: ListPreview,
             title_key: "settings.clipboard.preview_types",
             description_key: Some("settings.clipboard.preview_types_description"),
             ratio: 0.82,
@@ -733,6 +765,12 @@ fn search_target_specs() -> &'static [SearchTargetSpec] {
         },
         SearchTargetSpec {
             page: Shortcuts,
+            title_key: "settings.shortcuts.toggle_formatted_paste",
+            description_key: None,
+            ratio: 0.15,
+        },
+        SearchTargetSpec {
+            page: Shortcuts,
             title_key: "settings.shortcuts.upload_latest",
             description_key: None,
             ratio: 0.16,
@@ -754,6 +792,12 @@ fn search_target_specs() -> &'static [SearchTargetSpec] {
             title_key: "settings.shortcuts.quick_paste",
             description_key: None,
             ratio: 0.26,
+        },
+        SearchTargetSpec {
+            page: Shortcuts,
+            title_key: "settings.shortcuts.add_favorite",
+            description_key: None,
+            ratio: 0.30,
         },
         SearchTargetSpec {
             page: Shortcuts,
@@ -838,6 +882,18 @@ fn search_target_specs() -> &'static [SearchTargetSpec] {
             title_key: "settings.shortcuts.toggle_pinned",
             description_key: None,
             ratio: 0.96,
+        },
+        SearchTargetSpec {
+            page: Shortcuts,
+            title_key: "settings.shortcuts.pin_to_screen",
+            description_key: None,
+            ratio: 0.965,
+        },
+        SearchTargetSpec {
+            page: Shortcuts,
+            title_key: "settings.shortcuts.split_words",
+            description_key: None,
+            ratio: 0.97,
         },
         SearchTargetSpec {
             page: Shortcuts,
@@ -1143,14 +1199,7 @@ struct SettingsWindowView {
     application_filter_error: Option<String>,
     selected_shortcut_category: ShortcutCategory,
     shortcut_scroll_handle: gpui::ScrollHandle,
-    recording_shortcut: bool,
-    recording_open_settings: bool,
-    recording_toggle_clipboard_monitor: bool,
-    recording_upload_latest: bool,
-    recording_pull_latest: bool,
-    recording_plain_text_paste: bool,
-    recording_quick_paste: bool,
-    recording_session_shortcut: Option<crate::config::SessionShortcutId>,
+    recording_target: Option<ShortcutRecordingTarget>,
     recording_focus_handle: FocusHandle,
     adaptive_max_lines_slider: Entity<SliderState>,
     middle_mouse_threshold_slider: Entity<SliderState>,
@@ -1170,6 +1219,7 @@ struct SettingsWindowView {
     copy_volume_slider: Entity<SliderState>,
     page_hover_delay_slider: Entity<SliderState>,
     filter_hover_delay_slider: Entity<SliderState>,
+    hover_preview_delay_slider: Entity<SliderState>,
     _adaptive_max_lines_subscription: Subscription,
     _middle_mouse_threshold_subscription: Subscription,
     _window_material_opacity_subscription: Subscription,
@@ -1180,6 +1230,7 @@ struct SettingsWindowView {
     _copy_volume_subscription: Subscription,
     _page_hover_delay_subscription: Subscription,
     _filter_hover_delay_subscription: Subscription,
+    _hover_preview_delay_subscription: Subscription,
     _history_retention_subscription: Subscription,
     _history_max_items_subscription: Subscription,
     _shortcut_recording_blur_subscription: Subscription,
@@ -1289,6 +1340,13 @@ impl SettingsWindowView {
                 .min(f32::from(ClipboardConfig::TAB_BAR_HOVER_DELAY_MIN_MS))
                 .step(10.0)
                 .default_value(f32::from(clipboard_config.filter_hover_delay_ms))
+        });
+        let hover_preview_delay_slider = cx.new(|_| {
+            SliderState::new()
+                .max(f32::from(ClipboardConfig::HOVER_PREVIEW_DELAY_MAX_MS))
+                .min(f32::from(ClipboardConfig::HOVER_PREVIEW_DELAY_MIN_MS))
+                .step(10.0)
+                .default_value(f32::from(clipboard_config.hover_preview_delay_ms))
         });
         let history_config = config_runtime::history_config(cx);
         let unlimited_placeholder =
@@ -1554,13 +1612,25 @@ impl SettingsWindowView {
             &page_hover_delay_slider,
             window,
             cx,
+            TAB_BAR_HOVER_DELAY_RANGE,
             |clipboard, delay| clipboard.page_hover_delay_ms = delay,
         );
         let filter_hover_delay_subscription = clipboard_hover_delay_subscription(
             &filter_hover_delay_slider,
             window,
             cx,
+            TAB_BAR_HOVER_DELAY_RANGE,
             |clipboard, delay| clipboard.filter_hover_delay_ms = delay,
+        );
+        let hover_preview_delay_subscription = clipboard_hover_delay_subscription(
+            &hover_preview_delay_slider,
+            window,
+            cx,
+            (
+                ClipboardConfig::HOVER_PREVIEW_DELAY_MIN_MS,
+                ClipboardConfig::HOVER_PREVIEW_DELAY_MAX_MS,
+            ),
+            |clipboard, delay| clipboard.hover_preview_delay_ms = delay,
         );
         let clipboard_format_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(
@@ -1589,7 +1659,7 @@ impl SettingsWindowView {
         });
         let shortcut_recording_blur_subscription =
             cx.on_blur(&recording_focus_handle, window, |view, _, cx| {
-                if !view.recording_shortcut {
+                if view.recording_target.is_none() {
                     return;
                 }
                 if let Err(error) = hotkey::cancel_toggle_main_window_recording(cx) {
@@ -1600,14 +1670,7 @@ impl SettingsWindowView {
                         cx,
                     );
                 }
-                view.recording_shortcut = false;
-                view.recording_open_settings = false;
-                view.recording_toggle_clipboard_monitor = false;
-                view.recording_upload_latest = false;
-                view.recording_pull_latest = false;
-                view.recording_plain_text_paste = false;
-                view.recording_quick_paste = false;
-                view.recording_session_shortcut = None;
+                view.recording_target = None;
                 cx.notify();
             });
         let sync_form = pages::sync::SyncForm::new(window, cx);
@@ -1659,14 +1722,7 @@ impl SettingsWindowView {
             application_filter_error: None,
             selected_shortcut_category: ShortcutCategory::Global,
             shortcut_scroll_handle,
-            recording_shortcut: false,
-            recording_open_settings: false,
-            recording_toggle_clipboard_monitor: false,
-            recording_upload_latest: false,
-            recording_pull_latest: false,
-            recording_plain_text_paste: false,
-            recording_quick_paste: false,
-            recording_session_shortcut: None,
+            recording_target: None,
             recording_focus_handle,
             adaptive_max_lines_slider,
             middle_mouse_threshold_slider,
@@ -1678,6 +1734,7 @@ impl SettingsWindowView {
             copy_volume_slider,
             page_hover_delay_slider,
             filter_hover_delay_slider,
+            hover_preview_delay_slider,
             search_engine_name_input,
             clipboard_format_input,
             clipboard_formats_expanded: false,
@@ -1694,6 +1751,7 @@ impl SettingsWindowView {
             _copy_volume_subscription: copy_volume_subscription,
             _page_hover_delay_subscription: page_hover_delay_subscription,
             _filter_hover_delay_subscription: filter_hover_delay_subscription,
+            _hover_preview_delay_subscription: hover_preview_delay_subscription,
             _history_retention_subscription: history_retention_subscription,
             _history_max_items_subscription: history_max_items_subscription,
             _shortcut_recording_blur_subscription: shortcut_recording_blur_subscription,

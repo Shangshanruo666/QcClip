@@ -28,6 +28,8 @@
 
 跨设备同步设置由独立的 [services/sync/config.rs](../src/services/sync/config.rs) 管理，不写入 `config.json` 或 `state.json`。Windows 上的设备身份、配对、发送序号、连接及设备策略和 WebDAV 凭据统一通过 DPAPI 保护，保存于 `%LOCALAPPDATA%/QcClipDevice/sync.bin`，不使用 Windows 凭据管理器，不随内容导入或数据目录迁移覆盖。清理日志 `sync-cache-*.json` 仅保存待回收对象的随机标识。配置语义见[同步使用说明](sync-guide.md)。
 
+托盘菜单中的“格式粘贴”保存为 `config.json` 的 `clipboard.formattedPaste`，默认开启。关闭后默认粘贴和合并粘贴都优先只粘贴纯文本，条目没有纯文本时按原格式粘贴；文件和图片合并保持原样。右键菜单指定格式粘贴和复制操作不受影响。
+
 标签面板中的“切换页面时清空选择”保存为 `config.json` 的 `clipboard.clearTagsOnTabSwitch`，默认关闭；开启后切换到历史或收藏页面时清空标签选择。
 
 ## 配置分组
@@ -100,6 +102,8 @@
 - 找不到主题 ID 时，通过主题运行时选择对应模式的默认或可用主题。
 
 `appearance.uiScalePercent` 保存界面缩放百分比，默认 100，范围为 80～200。设置保存后立即刷新所有窗口，切换主题时从主题原始字号重新应用比例。界面文字、图标和控件尺寸随比例调整；系统 DPI、桌面坐标与图片原始尺寸独立计算。
+
+`appearance.previewScalePercent` 保存悬停预览窗口的额外缩放百分比，默认 100，范围为 80～200，在“列表与预览”设置页调整。预览窗口的 rem 基准为 `16 × 界面缩放 × 预览缩放`，正文、备注、信息栏和文件信息随之调整；图片显示尺寸由预览内的缩放操作单独控制，不受此项影响。修改后刷新窗口，预览在下次绘制时按新尺寸重新换行和布局。
 
 `appearance.itemDisplay` 控制主窗口剪贴板和收藏条目的首行信息及右上角控件，与行高独立。`infoVisibility` 控制首行信息，`toolbarVisibility` 控制右上角的来源图标和序号，`actionsVisibility` 独立控制右上角的操作按钮。三组均支持 `always`（始终显示）、`active`（悬停或选中）、`hidden`（隐藏）；`fields` 保存启用的具体信息和按钮。默认首行、来源和序号常显，操作按钮在悬停或选中时展开，全部字段启用。
 

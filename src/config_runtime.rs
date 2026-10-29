@@ -64,6 +64,7 @@ impl ConfigRuntime {
         crate::platform::clipboard::set_capture_format_config(
             config.clipboard.capture_formats.clone(),
         );
+        crate::services::paste::set_formatted_paste_enabled(config.clipboard.formatted_paste);
         cx.set_global(Self { config, path });
     }
 
@@ -73,6 +74,7 @@ impl ConfigRuntime {
         crate::platform::clipboard::set_capture_format_config(
             config.clipboard.capture_formats.clone(),
         );
+        crate::services::paste::set_formatted_paste_enabled(config.clipboard.formatted_paste);
         let previous = cx.update_global::<Self, _>(|runtime, _| {
             let previous = runtime.config.clone();
             runtime.config = config.clone();
@@ -312,6 +314,10 @@ pub(crate) fn preview_information_config(cx: &App) -> PreviewInformationConfig {
 
 pub(crate) fn hover_preview_enabled(cx: &App) -> bool {
     cx.read_global::<ConfigRuntime, _>(|runtime, _| runtime.config.clipboard.hover_preview_enabled)
+}
+
+pub(crate) fn hover_preview_delay_ms(cx: &App) -> u16 {
+    cx.read_global::<ConfigRuntime, _>(|runtime, _| runtime.config.clipboard.hover_preview_delay_ms)
 }
 
 pub(crate) fn sound_config(cx: &App) -> SoundConfig {
@@ -637,7 +643,9 @@ fn apply_appearance_change(previous: &AppearanceConfig, current: &AppearanceConf
         if background_image_needs_refresh(previous, current) {
             crate::window_material::refresh_background_image(cx);
         }
-    } else if previous.preview_information != current.preview_information {
+    } else if previous.preview_information != current.preview_information
+        || previous.preview_scale_percent != current.preview_scale_percent
+    {
         cx.refresh_windows();
     } else {
         // 调用方会更新设置窗口，这里只额外让主窗口视图失效。
@@ -693,6 +701,7 @@ pub(crate) fn set_clipboard_config(
     }
     next.clipboard = clipboard.clone();
     persist_config(&path, &next)?;
+    crate::services::paste::set_formatted_paste_enabled(clipboard.formatted_paste);
     crate::platform::clipboard::set_capture_format_config(clipboard.capture_formats);
 
     cx.update_global::<ConfigRuntime, _>(|runtime, _| {

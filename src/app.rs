@@ -226,6 +226,21 @@ pub fn run() {
                 crate::services::image_preview::ImagePreviewService::new(_raw_blob_store.clone()),
                 cx,
             );
+            crate::windows::sticky::StickyService::install(
+                history_repository.clone(),
+                paste_service.clone(),
+                CustomTextService::new(_database.clone(), _raw_blob_store.clone()),
+                crate::services::image_preview::ImagePreviewService::new(_raw_blob_store.clone()),
+                cx,
+            );
+            crate::services::quick_favorite::QuickFavoriteService::install(
+                tag_repository.clone(),
+                CustomTextService::new(_database.clone(), _raw_blob_store.clone()),
+                favorite_repository.clone(),
+                capture_service.clone(),
+                clipboard_write_suppressor.clone(),
+                cx,
+            );
             crate::hotkey::HotkeyRuntime::install(cx);
             #[cfg(target_os = "windows")]
             crate::services::tray::TrayService::install(cx);
@@ -326,6 +341,7 @@ pub fn run() {
                     panic!("无法创建剪贴板窗口：{error}");
                 });
             crate::windows::renderer_warning::check(main_window.into(), cx);
+            crate::windows::sticky::StickyService::restore(cx);
             crate::windows::main::MainWindowService::set_window(
                 main_window.into(),
                 initially_visible,

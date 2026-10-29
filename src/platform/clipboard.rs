@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::config::ClipboardFormatConfig;
-use crate::domain::capture::CapturedClipboard;
+use crate::domain::capture::{CapturedClipboard, FormatKind};
 
 static CAPTURE_FORMAT_CONFIG: OnceLock<RwLock<ClipboardFormatConfig>> = OnceLock::new();
 
@@ -168,6 +168,26 @@ impl ClipboardWriteSuppressor {
     }
 }
 
+pub fn captured_plain_text(captured: &CapturedClipboard) -> Option<String> {
+    let bytes = captured.formats.iter().find_map(|format| {
+        if format.format_kind != FormatKind::Text
+            || !format.format_key.eq_ignore_ascii_case("CF_UNICODETEXT")
+        {
+            return None;
+        }
+        format.bytes.as_deref()
+    })?;
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    let mut text = String::from_utf16_lossy(&units);
+    if text.ends_with('\0') {
+        text.pop();
+    }
+    Some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +211,83 @@ mod tests {
 
         assert!(!suppressor.suppress_event(11));
     }
+
+    fn captured_with(formats: Vec<crate::domain::capture::RawFormat>) -> CapturedClipboard {
+        CapturedClipboard {
+            formats,
+            primary_format_identity: None,
+            preview_candidate: None,
+            source_application: Default::default(),
+        }
+    }
+
+    fn unicode_format(bytes: Vec<u8>) -> crate::domain::capture::RawFormat {
+        crate::domain::capture::RawFormat::captured(
+            "windows",
+            "CF_UNICODETEXT",
+            "CF_UNICODETEXT",
+            FormatKind::Text,
+            bytes,
+            0,
+            true,
+        )
+    }
+
+    fn unicode_bytes(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn captured_plain_text_decodes_ascii_and_chinese() {
+        let ascii = captured_with(vec![unicode_format(unicode_bytes("hello"))]);
+        assert_eq!(captured_plain_text(&ascii).as_deref(), Some("hello"));
+
+        let chinese = captured_with(vec![unicode_format(unicode_bytes("中文文本"))]);
+        assert_eq!(captured_plain_text(&chinese).as_deref(), Some("中文文本"));
+    }
+
+    #[test]
+    fn captured_plain_text_drops_trailing_nul_but_keeps_spaces() {
+        let mut bytes = unicode_bytes("文本 ");
+        bytes.extend_from_slice(&[0, 0]);
+        let captured = captured_with(vec![unicode_format(bytes)]);
+
+        assert_eq!(captured_plain_text(&captured).as_deref(), Some("文本 "));
+    }
+
+    #[test]
+    fn captured_plain_text_requires_unicode_text() {
+        let file_list = captured_with(vec![crate::domain::capture::RawFormat::captured(
+            "windows",
+            "CF_HDROP",
+            "CF_HDROP",
+            FormatKind::FileList,
+            vec![1, 2, 3],
+            0,
+            true,
+        )]);
+        assert_eq!(captured_plain_text(&file_list), None);
+
+        let ansi = captured_with(vec![crate::domain::capture::RawFormat::captured(
+            "windows",
+            "CF_TEXT",
+            "CF_TEXT",
+            FormatKind::Text,
+            b"hello\0".to_vec(),
+            0,
+            true,
+        )]);
+        assert_eq!(captured_plain_text(&ansi), None);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn selection_capture_reports_unsupported_platform_instead_of_no_selection() {
+        assert!(matches!(
+            capture_selection(&ClipboardWriteSuppressor::default()),
+            Err(SystemClipboardError::UnsupportedPlatform)
+        ));
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -210,7 +307,7 @@ mod windows_clipboard {
     use thiserror::Error;
     use windows::{
         Win32::{
-            Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND},
+            Foundation::{CloseHandle, E_ACCESSDENIED, GlobalFree, HANDLE, HGLOBAL, HWND},
             System::{
                 DataExchange::{
                     CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
@@ -245,9 +342,11 @@ mod windows_clipboard {
         create_image_temp_file, hdrop_bytes, retain_image_temp_file,
     };
 
-    const READ_ATTEMPTS: usize = 3;
-    const READ_RETRY_DELAY: Duration = Duration::from_millis(20);
+    const CLIPBOARD_OPEN_TIMEOUT: Duration = Duration::from_millis(250);
+    const CLIPBOARD_OPEN_RETRY_DELAY: Duration = Duration::from_millis(20);
     const PASTE_DELAY: Duration = Duration::from_millis(60);
+    // 10ms × 50 = 500ms；无选区时尽快回退到编辑器。
+    const SELECTION_CAPTURE_ATTEMPTS: usize = 50;
 
     fn clipboard_sequence_number() -> u32 {
         // SAFETY: GetClipboardSequenceNumber 不需要指针或外部内存，仅读取系统剪贴板序列号。
@@ -258,8 +357,8 @@ mod windows_clipboard {
     pub enum SystemClipboardError {
         #[error("无法初始化系统剪贴板：{0}")]
         Initialize(String),
-        #[error("无法读取系统剪贴板格式列表：{0}")]
-        Enumerate(String),
+        #[error("无法打开系统剪贴板：{0}")]
+        Open(String),
     }
 
     pub struct WindowsClipboardSource;
@@ -274,7 +373,7 @@ mod windows_clipboard {
             let config = super::capture_format_config();
             // 枚举、原始格式和文件摘要共用一次打开，避免外部工具在读取中途替换内容。
             let clipboard =
-                ClipboardGuard::open_for_capture().map_err(SystemClipboardError::Enumerate)?;
+                ClipboardGuard::open_for_capture().map_err(SystemClipboardError::Open)?;
             let native_formats = clipboard.formats();
             if should_ignore_clipboard(&native_formats, |format_id| {
                 clipboard.read_buffer(format_id)
@@ -320,6 +419,56 @@ mod windows_clipboard {
                 source_application,
             }))
         }
+    }
+
+    pub fn capture_selection(
+        suppressor: &ClipboardWriteSuppressor,
+    ) -> Result<Option<CapturedClipboard>, SystemClipboardError> {
+        let before = clipboard_sequence_number();
+        let source = source_application();
+        capture_selection_with(
+            suppressor,
+            before,
+            source,
+            crate::platform::input::simulate_ctrl_insert,
+            || {
+                thread::sleep(Duration::from_millis(10));
+                clipboard_sequence_number()
+            },
+            || WindowsClipboardSource::new().capture_current(),
+        )
+    }
+
+    fn capture_selection_with(
+        suppressor: &ClipboardWriteSuppressor,
+        before: u32,
+        source: SourceApplication,
+        simulate_copy: impl FnOnce(),
+        mut poll_sequence: impl FnMut() -> u32,
+        read_clipboard: impl FnOnce() -> Result<Option<CapturedClipboard>, SystemClipboardError>,
+    ) -> Result<Option<CapturedClipboard>, SystemClipboardError> {
+        let ticket = suppressor.begin_write(before);
+        simulate_copy();
+        for _ in 0..SELECTION_CAPTURE_ATTEMPTS {
+            let after = poll_sequence();
+            if after != before {
+                suppressor.complete_write(ticket, after);
+                return match read_clipboard() {
+                    Ok(captured) => Ok(captured),
+                    Err(error) => {
+                        tracing::warn!(%error, "模拟 Ctrl+Insert 后读取剪贴板失败");
+                        Err(error)
+                    }
+                };
+            }
+        }
+        suppressor.cancel_write(ticket);
+        tracing::debug!(
+            before,
+            source = ?source,
+            "模拟 Ctrl+Insert 后 500 毫秒内未检测到剪贴板变化"
+        );
+        Ok(None)
     }
 
     struct ClipboardChangeHandler {
@@ -731,18 +880,25 @@ mod windows_clipboard {
         }
 
         fn open_with_window(window: Option<ClipboardReadWindow>) -> Result<Self, String> {
-            let mut last_error = None;
-            for attempt in 0..READ_ATTEMPTS {
+            let deadline = Instant::now() + CLIPBOARD_OPEN_TIMEOUT;
+            loop {
                 // SAFETY: 非空窗口属于当前线程，避免同进程其他线程用空句柄重入并关闭剪贴板。
                 match unsafe { OpenClipboard(window.as_ref().map(|window| window.0)) } {
                     Ok(()) => return Ok(Self { _window: window }),
-                    Err(error) => last_error = Some(error.to_string()),
-                }
-                if attempt + 1 < READ_ATTEMPTS {
-                    thread::sleep(READ_RETRY_DELAY);
+                    // 另一窗口持有剪贴板时返回拒绝访问；只在有限预算内等待其释放。
+                    Err(error) if error.code() == E_ACCESSDENIED => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        thread::sleep(CLIPBOARD_OPEN_RETRY_DELAY.min(remaining));
+                        if Instant::now() >= deadline {
+                            return Err(format!(
+                                "等待 {} 毫秒后仍无法访问剪贴板：{error}",
+                                CLIPBOARD_OPEN_TIMEOUT.as_millis()
+                            ));
+                        }
+                    }
+                    Err(error) => return Err(error.to_string()),
                 }
             }
-            Err(last_error.unwrap_or_else(|| "未知错误".to_owned()))
         }
 
         fn formats(&self) -> Vec<NativeFormat> {
@@ -1007,6 +1163,93 @@ mod windows_clipboard {
     mod tests {
         use super::*;
 
+        #[test]
+        fn selection_capture_preserves_system_read_error_after_clipboard_changes() {
+            let suppressor = ClipboardWriteSuppressor::default();
+            let result = capture_selection_with(
+                &suppressor,
+                40,
+                SourceApplication::default(),
+                || {},
+                || 41,
+                || Err(SystemClipboardError::Open("access denied".to_owned())),
+            );
+
+            assert!(
+                matches!(result, Err(SystemClipboardError::Open(ref message)) if message == "access denied"),
+                "系统读取失败必须保留错误，不能报告无选区：{result:?}"
+            );
+            assert!(suppressor.suppress_event(41));
+            assert!(!suppressor.suppress_event(42));
+        }
+
+        #[test]
+        fn selection_capture_timeout_does_not_read_stale_clipboard_or_suppress_next_copy() {
+            let suppressor = ClipboardWriteSuppressor::default();
+            let result = capture_selection_with(
+                &suppressor,
+                40,
+                SourceApplication::default(),
+                || {},
+                || 40,
+                || panic!("复制未改变剪贴板时不能读取旧内容"),
+            );
+
+            assert!(matches!(result, Ok(None)));
+            assert!(!suppressor.suppress_event(41));
+        }
+
+        #[test]
+        fn selection_capture_waits_for_change_and_preserves_all_formats() {
+            let suppressor = ClipboardWriteSuppressor::default();
+            let captured = CapturedClipboard {
+                formats: vec![
+                    RawFormat::captured(
+                        "windows",
+                        "CF_UNICODETEXT",
+                        "CF_UNICODETEXT",
+                        FormatKind::Text,
+                        vec![104, 0, 105, 0],
+                        0,
+                        true,
+                    ),
+                    RawFormat::captured(
+                        "windows",
+                        "registered:HTML Format",
+                        "HTML Format",
+                        FormatKind::Html,
+                        b"<b>hi</b>".to_vec(),
+                        1,
+                        true,
+                    ),
+                ],
+                primary_format_identity: Some(("windows".into(), "CF_UNICODETEXT".into())),
+                preview_candidate: None,
+                source_application: SourceApplication::default(),
+            };
+            let expected = captured.clone();
+            let sequence = std::cell::Cell::new(40);
+            let result = capture_selection_with(
+                &suppressor,
+                40,
+                SourceApplication::default(),
+                || {},
+                || {
+                    let current = sequence.get();
+                    sequence.set(current + 1);
+                    current
+                },
+                || {
+                    assert_eq!(sequence.get(), 42, "必须等序列号变化后再读取");
+                    Ok(Some(captured))
+                },
+            );
+
+            assert_eq!(result.unwrap(), Some(expected));
+            assert!(suppressor.suppress_event(41));
+            assert!(!suppressor.suppress_event(42));
+        }
+
         fn native_format(name: &str) -> NativeFormat {
             NativeFormat {
                 id: 49_152,
@@ -1207,6 +1450,68 @@ mod windows_clipboard {
         }
 
         #[test]
+        fn capture_guard_reports_invalid_window_without_waiting_for_contention() {
+            // HWND=1 不是有效的系统窗口；Win32 在触及剪贴板数据前就会拒绝它。
+            let window = ClipboardReadWindow(HWND(1_usize as *mut _));
+            let started = Instant::now();
+            let result = ClipboardGuard::open_with_window(Some(window));
+            assert!(result.is_err());
+            assert!(result.err().unwrap().contains("0x80070578"));
+            assert!(
+                started.elapsed() < Duration::from_millis(100),
+                "无效窗口句柄不应消耗锁竞争的等待预算"
+            );
+        }
+
+        // 这些测试只持有系统剪贴板锁，不读取、清空或写入用户数据。
+        // 触达全局系统资源，需 --ignored --test-threads=1 单独运行。
+        fn hold_system_clipboard_for(duration: Duration) -> thread::JoinHandle<()> {
+            let (ready, receiver) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let clipboard = ClipboardGuard::open_for_capture();
+                ready
+                    .send(clipboard.as_ref().map(|_| ()).map_err(Clone::clone))
+                    .unwrap();
+                let _clipboard = clipboard.expect("无法取得测试所需的剪贴板锁");
+                thread::sleep(duration);
+            });
+            receiver.recv().unwrap().expect("无法初始化只读锁竞争测试");
+            worker
+        }
+
+        #[test]
+        #[ignore = "访问系统剪贴板的只读锁竞争测试，需单独运行"]
+        fn capture_guard_recovers_after_short_clipboard_contention() {
+            let holder = hold_system_clipboard_for(Duration::from_millis(100));
+            let result = ClipboardGuard::open_for_capture();
+            holder.join().unwrap();
+            assert!(
+                result.is_ok(),
+                "100毫秒的短暂锁竞争不应导致捕获失败：{}",
+                result.err().unwrap_or_default()
+            );
+        }
+
+        #[test]
+        #[ignore = "访问系统剪贴板的只读锁竞争测试，需单独运行"]
+        fn capture_guard_reports_persistent_clipboard_contention_within_budget() {
+            let holder = hold_system_clipboard_for(Duration::from_millis(750));
+            let started = Instant::now();
+            let result = ClipboardGuard::open_for_capture();
+            let elapsed = started.elapsed();
+            holder.join().unwrap();
+            assert!(
+                result.is_err(),
+                "持续被占用时必须返回错误，不能伪装成空剪贴板"
+            );
+            assert!(
+                elapsed < Duration::from_millis(600),
+                "打开剪贴板必须有界：{elapsed:?}"
+            );
+            assert!(result.err().unwrap().contains("0x80070005"));
+        }
+
+        #[test]
         #[ignore = "访问系统剪贴板的只读集成测试，需单独运行"]
         fn capture_guard_prevents_cross_thread_reopen_and_releases_its_window() {
             use windows::Win32::{
@@ -1355,15 +1660,15 @@ mod windows_clipboard {
 
 #[cfg(target_os = "windows")]
 pub use windows_clipboard::{
-    ClipboardMonitor, SystemClipboardError, WindowsClipboardSource, copy_to_clipboard,
-    paste_into_active_window,
+    ClipboardMonitor, SystemClipboardError, WindowsClipboardSource, capture_selection,
+    copy_to_clipboard, paste_into_active_window,
 };
 
 #[cfg(not(target_os = "windows"))]
 mod unsupported {
     use thiserror::Error;
 
-    use super::ClipboardEventReceiver;
+    use super::{ClipboardEventReceiver, ClipboardWriteSuppressor};
 
     #[derive(Debug, Error)]
     pub enum SystemClipboardError {
@@ -1384,6 +1689,13 @@ mod unsupported {
 
 #[cfg(not(target_os = "windows"))]
 pub use unsupported::{ClipboardMonitor, SystemClipboardError};
+
+#[cfg(not(target_os = "windows"))]
+pub fn capture_selection(
+    _suppressor: &ClipboardWriteSuppressor,
+) -> Result<Option<CapturedClipboard>, SystemClipboardError> {
+    Err(SystemClipboardError::UnsupportedPlatform)
+}
 
 #[cfg(not(target_os = "windows"))]
 pub fn paste_into_active_window(
