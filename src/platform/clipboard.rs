@@ -331,7 +331,7 @@ mod windows_clipboard {
         core::{PCWSTR, PWSTR, w},
     };
 
-    use super::transient::{ClipboardObservation, filter_events};
+    use super::transient::{ClipboardEvent, ClipboardObservation, filter_events};
     use super::{ClipboardPayload, ClipboardWriteSuppressor};
     use crate::domain::capture::{
         CapturedClipboard, FormatKind, FormatRole, RawFormat, SourceApplication,
@@ -473,7 +473,7 @@ mod windows_clipboard {
 
     struct ClipboardChangeHandler {
         source: WindowsClipboardSource,
-        sender: Sender<Result<ClipboardObservation, String>>,
+        sender: Sender<ClipboardEvent>,
         suppressor: ClipboardWriteSuppressor,
     }
 
@@ -481,17 +481,25 @@ mod windows_clipboard {
         fn on_clipboard_change(&mut self) {
             let recordable = !self.suppressor.suppress_event(clipboard_sequence_number());
             let observed_at = Instant::now();
-            let result = match self.source.capture_current() {
+            if self
+                .sender
+                .send(ClipboardEvent::CaptureStarted(observed_at))
+                .is_err()
+            {
+                tracing::debug!("剪贴板监听接收端已关闭");
+                return;
+            }
+            let event = match self.source.capture_current() {
                 // 自身写入仍参与还原比对，但不会进入历史记录或触发复制提示。
-                Ok(Some(captured)) => Ok(ClipboardObservation {
+                Ok(Some(captured)) => ClipboardEvent::Captured(Ok(ClipboardObservation {
                     captured,
                     recordable,
                     observed_at,
-                }),
-                Ok(None) => return,
-                Err(error) => Err(error.to_string()),
+                })),
+                Ok(None) => ClipboardEvent::Skipped,
+                Err(error) => ClipboardEvent::Captured(Err(error.to_string())),
             };
-            if self.sender.send(result).is_err() {
+            if self.sender.send(event).is_err() {
                 tracing::debug!("剪贴板监听接收端已关闭");
             }
         }

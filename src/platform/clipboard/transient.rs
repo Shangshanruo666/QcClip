@@ -12,6 +12,16 @@ use crate::{
 };
 
 const RESTORE_WINDOW: Duration = Duration::from_millis(300);
+// 读取大图时应用可能延迟渲染多种格式；超过该时长仍未完成时不再阻塞已到期的内容。
+const CAPTURE_IN_FLIGHT_LIMIT: Duration = Duration::from_secs(3);
+
+pub(super) enum ClipboardEvent {
+    /// 监听线程开始读取剪贴板，读取完成前不提交已到期的待确认内容。
+    CaptureStarted(Instant),
+    Captured(Result<ClipboardObservation, String>),
+    /// 本次读取被忽略或没有内容。
+    Skipped,
+}
 
 pub(super) struct ClipboardObservation {
     pub captured: CapturedClipboard,
@@ -197,28 +207,51 @@ fn fingerprint(captured: &CapturedClipboard) -> Option<ClipboardFingerprint> {
 }
 
 pub(super) fn filter_events(
-    receiver: Receiver<Result<ClipboardObservation, String>>,
+    receiver: Receiver<ClipboardEvent>,
     sender: Sender<Result<CapturedClipboard, String>>,
     initial: Option<CapturedClipboard>,
 ) {
     let mut filter = TransientClipboardFilter::new(initial.as_ref());
     drop(initial);
+    let mut capture_started_at = None;
     loop {
-        let event = match filter.next_deadline() {
+        // 分步写入的后续快照可能因读取耗时晚于前一条的确认时间到达，读取期间推迟确认以便合并。
+        let deadline = filter
+            .next_deadline()
+            .map(|deadline| match capture_started_at {
+                Some(started_at) => deadline.max(started_at + CAPTURE_IN_FLIGHT_LIMIT),
+                None => deadline,
+            });
+        let event = match deadline {
             Some(deadline) => {
                 receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
             }
             None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         let ready = match event {
-            Ok(Ok(observation)) => filter.observe(observation),
-            Ok(Err(error)) => {
+            Ok(ClipboardEvent::CaptureStarted(started_at)) => {
+                capture_started_at = Some(started_at);
+                continue;
+            }
+            Ok(ClipboardEvent::Skipped) => {
+                capture_started_at = None;
+                continue;
+            }
+            Ok(ClipboardEvent::Captured(Ok(observation))) => {
+                capture_started_at = None;
+                filter.observe(observation)
+            }
+            Ok(ClipboardEvent::Captured(Err(error))) => {
+                capture_started_at = None;
                 if sender.send(Err(error)).is_err() {
                     break;
                 }
                 continue;
             }
-            Err(RecvTimeoutError::Timeout) => filter.take_ready(Instant::now()),
+            Err(RecvTimeoutError::Timeout) => {
+                capture_started_at = None;
+                filter.take_ready(Instant::now())
+            }
             // 停止监听时丢弃尚未确认的内容，避免关闭监听后继续入库和提示。
             Err(RecvTimeoutError::Disconnected) => break,
         };
@@ -420,11 +453,11 @@ mod tests {
             (text("关闭时尚未确认"), 900),
         ] {
             input
-                .send(Ok(observation(
+                .send(ClipboardEvent::Captured(Ok(observation(
                     captured,
                     now + Duration::from_millis(delay),
                     true,
-                )))
+                ))))
                 .unwrap();
         }
         drop(input);
@@ -864,7 +897,11 @@ mod tests {
         let (input, receiver) = std::sync::mpsc::channel();
         let (sender, output) = std::sync::mpsc::channel();
         input
-            .send(Ok(observation(text("未确认的内容"), Instant::now(), true)))
+            .send(ClipboardEvent::Captured(Ok(observation(
+                text("未确认的内容"),
+                Instant::now(),
+                true,
+            ))))
             .unwrap();
         drop(input);
         filter_events(receiver, sender, Some(text("原内容")));
@@ -886,14 +923,16 @@ mod tests {
                 (text("关闭时尚未确认的内容"), 1200),
             ] {
                 input
-                    .send(Ok(observation(
+                    .send(ClipboardEvent::Captured(Ok(observation(
                         captured,
                         now + Duration::from_millis(delay),
                         true,
-                    )))
+                    ))))
                     .unwrap();
             }
-            input.send(Err("处理完成".to_owned())).unwrap();
+            input
+                .send(ClipboardEvent::Captured(Err("处理完成".to_owned())))
+                .unwrap();
             drop(input);
             filter_events(receiver, sender, Some(original.clone()));
             assert_eq!(
@@ -922,11 +961,11 @@ mod tests {
             (text("关闭时尚未确认的内容"), 1900),
         ] {
             input
-                .send(Ok(observation(
+                .send(ClipboardEvent::Captured(Ok(observation(
                     captured,
                     now + Duration::from_millis(delay),
                     true,
-                )))
+                ))))
                 .unwrap();
         }
         drop(input);
@@ -979,20 +1018,80 @@ mod tests {
     }
 
     #[test]
+    fn worker_waits_for_a_slow_capture_before_confirming_its_format_subset() {
+        let file_only = CapturedClipboard {
+            formats: vec![RawFormat::captured(
+                "windows",
+                "CF_HDROP",
+                "CF_HDROP",
+                FormatKind::FileList,
+                vec![1; 8],
+                0,
+                true,
+            )],
+            primary_format_identity: None,
+            preview_candidate: None,
+            source_application: SourceApplication::default(),
+        };
+        let mut complete = file_only.clone();
+        complete.formats.push(RawFormat::captured(
+            "windows",
+            "CF_DIBV5",
+            "CF_DIBV5",
+            FormatKind::Image,
+            vec![2; 8],
+            1,
+            true,
+        ));
+        let (input, receiver) = std::sync::mpsc::channel();
+        let (sender, output) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            filter_events(receiver, sender, Some(text("原内容")));
+        });
+        let now = Instant::now();
+        input
+            .send(ClipboardEvent::Captured(Ok(observation(
+                file_only, now, true,
+            ))))
+            .unwrap();
+        let started_at = now + Duration::from_millis(130);
+        input
+            .send(ClipboardEvent::CaptureStarted(started_at))
+            .unwrap();
+        // 模拟读取大图耗时超过前一条的确认时间。
+        std::thread::sleep(RESTORE_WINDOW + Duration::from_millis(200));
+        input
+            .send(ClipboardEvent::Captured(Ok(observation(
+                complete.clone(),
+                started_at,
+                true,
+            ))))
+            .unwrap();
+        std::thread::sleep(RESTORE_WINDOW + Duration::from_millis(200));
+        drop(input);
+        worker.join().unwrap();
+        assert_eq!(output.into_iter().collect::<Vec<_>>(), vec![Ok(complete)]);
+    }
+
+    #[test]
     fn worker_filters_a_queued_round_trip_using_capture_times() {
         let now = Instant::now() - Duration::from_secs(1);
         let original = text("原内容");
         let (input, receiver) = std::sync::mpsc::channel();
         let (sender, output) = std::sync::mpsc::channel();
         input
-            .send(Ok(observation(text("划词内容"), now, true)))
+            .send(ClipboardEvent::Captured(Ok(observation(
+                text("划词内容"),
+                now,
+                true,
+            ))))
             .unwrap();
         input
-            .send(Ok(observation(
+            .send(ClipboardEvent::Captured(Ok(observation(
                 original.clone(),
                 now + Duration::from_millis(52),
                 true,
-            )))
+            ))))
             .unwrap();
         drop(input);
         filter_events(receiver, sender, Some(original));
