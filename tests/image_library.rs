@@ -94,3 +94,72 @@ fn delete_group_restores_images_when_group_list_cannot_be_saved() {
     assert_eq!(fs::read(&image_path).unwrap(), b"retained");
     assert_eq!(service.load_groups().unwrap()[0].id, group.id);
 }
+
+fn usage_scores(
+    service: &ImageLibraryService,
+    group: &image_library::ImageLibraryGroup,
+) -> Vec<(String, f64)> {
+    service
+        .list_images(group)
+        .unwrap()
+        .into_iter()
+        .map(|image| (image.name, image.usage_score))
+        .collect()
+}
+
+#[test]
+fn record_image_use_accumulates_score_per_image() {
+    let root = tempfile::tempdir().unwrap();
+    let service = ImageLibraryService::new(root.path());
+    let group = service.create_group("常用", None).unwrap();
+    let directory = root.path().join(&group.name);
+    fs::write(directory.join("a.png"), b"a").unwrap();
+    fs::write(directory.join("b.png"), b"b").unwrap();
+
+    service.record_image_use(&directory.join("a.png")).unwrap();
+    service.record_image_use(&directory.join("a.png")).unwrap();
+    service.record_image_use(&directory.join("b.png")).unwrap();
+
+    let scores = usage_scores(&service, &group);
+    assert_eq!(scores[0].0, "a.png");
+    assert!(scores[0].1 > 1.9 && scores[0].1 <= 2.0);
+    assert!(scores[1].1 > 0.9 && scores[1].1 <= 1.0);
+}
+
+#[test]
+fn usage_follows_rename_and_move_and_is_cleared_on_delete() {
+    let root = tempfile::tempdir().unwrap();
+    let service = ImageLibraryService::new(root.path());
+    let source = service.create_group("来源", None).unwrap();
+    let target = service.create_group("目标", None).unwrap();
+    let source_directory = root.path().join(&source.name);
+    fs::write(source_directory.join("a.png"), b"a").unwrap();
+    service
+        .record_image_use(&source_directory.join("a.png"))
+        .unwrap();
+
+    let renamed = service
+        .rename_image(&source, &source_directory.join("a.png"), "c")
+        .unwrap();
+    assert!(usage_scores(&service, &source)[0].1 > 0.9);
+
+    service.move_image(&source, &target, &renamed).unwrap();
+    let moved = usage_scores(&service, &target);
+    assert_eq!(moved[0].0, "c.png");
+    assert!(moved[0].1 > 0.9);
+
+    let target_path = root.path().join(&target.name).join("c.png");
+    service.delete_image(&target, &target_path).unwrap();
+    fs::write(&target_path, b"new").unwrap();
+    assert_eq!(usage_scores(&service, &target)[0].1, 0.0);
+}
+
+#[test]
+fn record_image_use_rejects_paths_outside_groups() {
+    let root = tempfile::tempdir().unwrap();
+    let service = ImageLibraryService::new(root.path());
+    service.create_group("组", None).unwrap();
+    let outside = root.path().join("outside.png");
+    fs::write(&outside, b"x").unwrap();
+    assert!(service.record_image_use(&outside).is_err());
+}

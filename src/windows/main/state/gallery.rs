@@ -628,9 +628,14 @@ impl MainWindow {
 
     pub(crate) fn paste_gallery_image(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let paste_service = self.paste_service.clone();
+        let image_library = self.image_library.clone();
         cx.defer(move |cx| {
             crate::windows::main::prepare_paste_target("粘贴图库图片", cx);
-            let task = cx.background_spawn(async move { paste_service.paste_gallery_image(&path) });
+            let task = cx.background_spawn(async move {
+                paste_service.paste_gallery_image(&path)?;
+                record_gallery_image_use(&image_library, &path);
+                Ok::<_, crate::services::paste::PasteError>(())
+            });
             cx.spawn(async move |cx| {
                 if let Err(error) = task.await {
                     tracing::error!("粘贴图库图片失败：{error}");
@@ -642,7 +647,12 @@ impl MainWindow {
 
     pub(crate) fn copy_gallery_image(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let paste_service = self.paste_service.clone();
-        let task = cx.background_spawn(async move { paste_service.copy_gallery_image(&path) });
+        let image_library = self.image_library.clone();
+        let task = cx.background_spawn(async move {
+            paste_service.copy_gallery_image(&path)?;
+            record_gallery_image_use(&image_library, &path);
+            Ok::<_, crate::services::paste::PasteError>(())
+        });
         cx.spawn(async move |_this, _cx| {
             if let Err(error) = task.await {
                 tracing::error!("复制图库图片失败：{error}");
@@ -746,5 +756,15 @@ impl MainWindow {
             Err(error) => tracing::error!("删除图库图片失败：{error}"),
         })
         .detach();
+    }
+}
+
+// 使用记录只影响排序，失败时不影响粘贴或复制结果。
+fn record_gallery_image_use(
+    image_library: &crate::services::image_library::ImageLibraryService,
+    path: &Path,
+) {
+    if let Err(error) = image_library.record_image_use(path) {
+        tracing::warn!("记录图库图片使用失败：{error}");
     }
 }

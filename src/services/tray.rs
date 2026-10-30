@@ -2,6 +2,7 @@ use gpui::{App, Global, Point};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::{
+    config::TrayClickAction,
     i18n,
     windows::menu::{MenuActionId, MenuIcon, MenuItem, MenuModel, MenuPosition, MenuService},
 };
@@ -32,24 +33,35 @@ impl TrayService {
             }
         };
 
+        if crate::config_runtime::hide_tray_icon(cx) {
+            if let Err(error) = icon.set_visible(false) {
+                tracing::error!("隐藏托盘图标失败：{error}");
+            }
+        }
         cx.set_global(Self { _icon: icon });
         let (sender, receiver) = async_channel::unbounded();
         TrayIconEvent::set_event_handler(Some(move |event| {
-            if let Some(action) = tray_event_action(event) {
-                let _ = sender.try_send(action);
+            if let Some(click) = tray_click(event) {
+                let _ = sender.try_send(click);
             }
         }));
         cx.spawn(async move |cx| {
-            while let Ok(action) = receiver.recv().await {
-                cx.update(|cx| match action {
-                    TrayEventAction::ToggleMainWindow => {
-                        crate::windows::main::toggle_main_window(cx)
-                    }
-                    TrayEventAction::OpenMenu(position) => open_menu(position, cx),
-                });
+            while let Ok(click) = receiver.recv().await {
+                cx.update(|cx| handle_click(click, cx));
             }
         })
         .detach();
+    }
+
+    /// 按当前配置显示或隐藏托盘图标。
+    pub(crate) fn sync_visibility(cx: &App) {
+        let Some(service) = cx.try_global::<Self>() else {
+            return;
+        };
+        let visible = !crate::config_runtime::hide_tray_icon(cx);
+        if let Err(error) = service._icon.set_visible(visible) {
+            tracing::error!("切换托盘图标显示状态失败：{error}");
+        }
     }
 
     pub(crate) fn contains_point(cx: &App, position: Point<f32>) -> bool {
@@ -89,12 +101,12 @@ fn load_tray_icon() -> Result<Icon, String> {
         .map_err(|error| format!("转换托盘图标失败：{error}"))
 }
 
-enum TrayEventAction {
-    ToggleMainWindow,
-    OpenMenu(MenuPosition),
+struct TrayClick {
+    right: bool,
+    position: MenuPosition,
 }
 
-fn tray_event_action(event: TrayIconEvent) -> Option<TrayEventAction> {
+fn tray_click(event: TrayIconEvent) -> Option<TrayClick> {
     let TrayIconEvent::Click {
         position,
         button,
@@ -105,24 +117,62 @@ fn tray_event_action(event: TrayIconEvent) -> Option<TrayEventAction> {
         return None;
     };
 
-    if button == MouseButton::Left {
-        let x = position.x as f32;
-        let y = position.y as f32;
-        if !x.is_finite() || !y.is_finite() {
-            return None;
-        }
-        return Some(TrayEventAction::ToggleMainWindow);
-    }
-    if button != MouseButton::Right {
-        return None;
-    }
-
+    let right = match button {
+        MouseButton::Left => false,
+        MouseButton::Right => true,
+        _ => return None,
+    };
     let x = position.x as f32;
     let y = position.y as f32;
     if !x.is_finite() || !y.is_finite() {
         return None;
     }
-    Some(TrayEventAction::OpenMenu(MenuPosition::tray(x, y, 1.0)))
+    Some(TrayClick {
+        right,
+        position: MenuPosition::tray(x, y, 1.0),
+    })
+}
+
+fn handle_click(click: TrayClick, cx: &mut App) {
+    use crate::windows::main::tabs::{SymbolCategoryId, TabId};
+    let (left_action, right_action) = crate::config_runtime::tray_click_actions(cx);
+    let action = if click.right {
+        right_action
+    } else {
+        left_action
+    };
+    match action {
+        TrayClickAction::None => {}
+        TrayClickAction::ToggleMainWindow => crate::windows::main::toggle_main_window(cx),
+        TrayClickAction::OpenMenu => open_menu(click.position, cx),
+        TrayClickAction::OpenSettings => crate::windows::settings::open_settings_window(cx),
+        TrayClickAction::OpenClipboard => {
+            crate::windows::main::show_main_window_page(TabId::Clipboard, None, cx)
+        }
+        TrayClickAction::OpenFavorites => {
+            crate::windows::main::show_main_window_page(TabId::Favorites, None, cx)
+        }
+        TrayClickAction::OpenEmoji => crate::windows::main::show_main_window_page(
+            TabId::Emoji,
+            Some(SymbolCategoryId::Emoji),
+            cx,
+        ),
+        TrayClickAction::OpenSymbols => crate::windows::main::show_main_window_page(
+            TabId::Emoji,
+            Some(SymbolCategoryId::Symbols),
+            cx,
+        ),
+        TrayClickAction::OpenGallery => crate::windows::main::show_main_window_page(
+            TabId::Emoji,
+            Some(SymbolCategoryId::Gallery),
+            cx,
+        ),
+        TrayClickAction::ToggleClipboardMonitor => {
+            crate::windows::main::MainWindowService::toggle_clipboard_listener(cx)
+        }
+        TrayClickAction::ToggleGlobalHotkeys => toggle_global_hotkeys(cx),
+        TrayClickAction::ToggleFormattedPaste => toggle_formatted_paste(cx),
+    }
 }
 
 fn open_menu(position: MenuPosition, cx: &mut App) {
@@ -257,39 +307,7 @@ fn handle_menu_action(action: MenuActionId, cx: &mut App) {
         TOGGLE_CLIPBOARD_MONITOR_ACTION => {
             crate::windows::main::MainWindowService::toggle_clipboard_listener(cx)
         }
-        TOGGLE_GLOBAL_HOTKEYS_ACTION => {
-            use crate::windows::notification::{NotificationLevel, NotificationService};
-            let enabled = !crate::hotkey::global_hotkeys_enabled(cx);
-            let result = crate::hotkey::toggle_global_hotkeys(cx);
-            let translator = i18n::translator(cx);
-            let (title_key, detail, level) = match result {
-                Ok(()) if enabled => (
-                    "notification.global_hotkeys.enabled.title",
-                    translator.translate("notification.global_hotkeys.enabled.detail"),
-                    NotificationLevel::Success,
-                ),
-                Ok(()) => (
-                    "notification.global_hotkeys.disabled.title",
-                    translator.translate("notification.global_hotkeys.disabled.detail"),
-                    NotificationLevel::Info,
-                ),
-                Err(error) => {
-                    tracing::error!("切换全局快捷键失败：{error}");
-                    (
-                        "notification.global_hotkeys.failed.title",
-                        error,
-                        NotificationLevel::Error,
-                    )
-                }
-            };
-            NotificationService::show_message_for(
-                crate::config::NotificationKind::FeatureStatus,
-                translator.translate(title_key),
-                detail,
-                level,
-                cx,
-            );
-        }
+        TOGGLE_GLOBAL_HOTKEYS_ACTION => toggle_global_hotkeys(cx),
         TOGGLE_FORMATTED_PASTE_ACTION => toggle_formatted_paste(cx),
         SETTINGS_ACTION => crate::windows::settings::open_settings_window(cx),
         CHECK_UPDATES_ACTION => crate::services::updates::UpdateService::check(true, cx),
@@ -298,6 +316,40 @@ fn handle_menu_action(action: MenuActionId, cx: &mut App) {
         QUIT_ACTION => cx.quit(),
         _ => {}
     }
+}
+
+fn toggle_global_hotkeys(cx: &mut App) {
+    use crate::windows::notification::{NotificationLevel, NotificationService};
+    let enabled = !crate::hotkey::global_hotkeys_enabled(cx);
+    let result = crate::hotkey::toggle_global_hotkeys(cx);
+    let translator = i18n::translator(cx);
+    let (title_key, detail, level) = match result {
+        Ok(()) if enabled => (
+            "notification.global_hotkeys.enabled.title",
+            translator.translate("notification.global_hotkeys.enabled.detail"),
+            NotificationLevel::Success,
+        ),
+        Ok(()) => (
+            "notification.global_hotkeys.disabled.title",
+            translator.translate("notification.global_hotkeys.disabled.detail"),
+            NotificationLevel::Info,
+        ),
+        Err(error) => {
+            tracing::error!("切换全局快捷键失败：{error}");
+            (
+                "notification.global_hotkeys.failed.title",
+                error,
+                NotificationLevel::Error,
+            )
+        }
+    };
+    NotificationService::show_message_for(
+        crate::config::NotificationKind::FeatureStatus,
+        translator.translate(title_key),
+        detail,
+        level,
+        cx,
+    );
 }
 
 pub(crate) fn toggle_formatted_paste(cx: &mut App) {

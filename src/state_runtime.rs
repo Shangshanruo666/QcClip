@@ -29,6 +29,7 @@ pub(crate) enum GallerySortField {
     Type,
     ModifiedDate,
     CreatedDate,
+    UsageFrequency,
 }
 
 impl Default for GallerySortField {

@@ -244,6 +244,27 @@ fn read_general(object: &Map<String, Value>, warnings: &mut Vec<String>) -> Gene
             default.run_as_administrator,
             warnings,
         ),
+        hide_tray_icon: read_field(
+            object,
+            "hideTrayIcon",
+            "general.hideTrayIcon",
+            default.hide_tray_icon,
+            warnings,
+        ),
+        tray_left_click_action: read_field(
+            object,
+            "trayLeftClickAction",
+            "general.trayLeftClickAction",
+            default.tray_left_click_action,
+            warnings,
+        ),
+        tray_right_click_action: read_field(
+            object,
+            "trayRightClickAction",
+            "general.trayRightClickAction",
+            default.tray_right_click_action,
+            warnings,
+        ),
     }
 }
 
@@ -1191,7 +1212,7 @@ mod tests {
     use crate::config::{
         AppearanceMode, CardItemGap, ClipboardDisplayPriority, ClipboardMouseBehavior,
         ClipboardWindowPosition, InterfaceLanguage, ListItemHeight, ListItemStyle, ShortcutBinding,
-        SoundPreset, TitlebarPosition, WindowMaterial,
+        SoundPreset, TitlebarPosition, TrayClickAction, WindowMaterial,
     };
 
     #[test]
@@ -1523,6 +1544,25 @@ mod tests {
             loaded.config.clipboard.display_priority,
             ClipboardDisplayPriority::HtmlImageText
         );
+    }
+
+    #[test]
+    fn tray_settings_are_loaded_from_general_config() {
+        for action in TrayClickAction::ALL {
+            let json = serde_json::json!({
+                "general": {
+                    "hideTrayIcon": true,
+                    "trayLeftClickAction": action.code(),
+                    "trayRightClickAction": action.code(),
+                }
+            });
+            let loaded = from_str(&json.to_string()).expect("托盘设置应当可以加载");
+
+            assert!(loaded.warnings.is_empty(), "托盘设置不应产生警告");
+            assert!(loaded.config.general.hide_tray_icon);
+            assert_eq!(loaded.config.general.tray_left_click_action, action);
+            assert_eq!(loaded.config.general.tray_right_click_action, action);
+        }
     }
 
     #[test]

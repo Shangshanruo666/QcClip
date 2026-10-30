@@ -1384,6 +1384,31 @@ pub(crate) fn is_window_resize_hit_test(
     Ok(is_resize_hit_test_value(hit_test.0))
 }
 
+/// 窗口输入法是否有未上屏的组字串；候选框是输入法自己的顶层窗口，组字期间点击它不算点击外部。
+#[cfg(target_os = "windows")]
+pub(crate) fn has_ime_composition(window: &Window) -> Result<bool, String> {
+    use windows::Win32::UI::Input::Ime::{
+        GCS_COMPSTR, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
+    };
+
+    let hwnd = window_hwnd(window)?;
+    // SAFETY: hwnd 已通过 IsWindow 校验且属于当前线程；输入法上下文在返回前释放。
+    unsafe {
+        let himc = ImmGetContext(hwnd);
+        if himc.is_invalid() {
+            return Ok(false);
+        }
+        let length = ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0);
+        let _ = ImmReleaseContext(hwnd, himc);
+        Ok(length > 0)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn has_ime_composition(_window: &Window) -> Result<bool, String> {
+    Ok(false)
+}
+
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn is_window_resize_hit_test(
     _window: &Window,

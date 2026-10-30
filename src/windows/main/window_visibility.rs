@@ -1689,6 +1689,9 @@ pub(crate) fn handle_global_mouse_down(
             if action == OutsideClickAction::Ignore {
                 return Ok(action);
             }
+            if platform_window::has_ime_composition(window)? {
+                return Ok(OutsideClickAction::Ignore);
+            }
             if platform_window::is_window_resize_hit_test(window, position)? {
                 return Ok(OutsideClickAction::Ignore);
             }

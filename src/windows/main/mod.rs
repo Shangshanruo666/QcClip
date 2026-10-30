@@ -783,6 +783,34 @@ pub fn toggle_main_window(cx: &mut App) {
     }
 }
 
+/// 切换到指定页面后显示主窗口；`symbol_category` 仅在表情页下生效。
+pub(crate) fn show_main_window_page(
+    tab: tabs::TabId,
+    symbol_category: Option<tabs::SymbolCategoryId>,
+    cx: &mut App,
+) {
+    let main_view = cx
+        .try_global::<MainWindowService>()
+        .and_then(|service| service.main_view.clone());
+    let Some(main_view) = main_view else {
+        tracing::error!("主窗口尚未就绪，无法打开指定页面");
+        return;
+    };
+    main_view.update(cx, |main, cx| {
+        main.select_tab(tab, cx);
+        if let Some(category) = symbol_category {
+            main.select_symbol_category(category, cx);
+        }
+    });
+    if let Err(error) = window_visibility::set_visibility(
+        true,
+        window_visibility::VisibilitySource::ExplicitToggle,
+        cx,
+    ) {
+        tracing::error!("显示主窗口失败：{error}");
+    }
+}
+
 pub fn hide_main_window_explicitly(cx: &mut App) {
     if let Err(error) = window_visibility::set_visibility(
         false,

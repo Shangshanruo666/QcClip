@@ -1,7 +1,9 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -11,6 +13,9 @@ use serde::{Deserialize, Serialize};
 const GROUPS_FILE_NAME: &str = "groups.json";
 const GROUP_ICONS_DIRECTORY_NAME: &str = ".groups_icons";
 const MAX_GROUP_ICON_BYTES: u64 = 32 * 1024 * 1024;
+const USAGE_FILE_NAME: &str = ".usage.json";
+// 使用分数按半衰期衰减，避免很久以前常用的图片一直排在最前。
+const USAGE_HALF_LIFE_SECS: f64 = 14.0 * 24.0 * 60.0 * 60.0;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 // Windows 原生拖放层把网络地址包装成此伪路径，再由图库导入阶段下载。
 const REMOTE_IMAGE_PATH_PREFIX: &str = "qcclip-url:";
@@ -33,7 +38,27 @@ pub(crate) struct ImageLibraryImage {
     pub(crate) file_type: String,
     pub(crate) modified_at: SystemTime,
     pub(crate) created_at: SystemTime,
+    pub(crate) usage_score: f64,
 }
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+struct ImageUsage {
+    score: f64,
+    last_used: u64,
+}
+
+impl ImageUsage {
+    fn score_at(&self, now: u64) -> f64 {
+        let elapsed = now.saturating_sub(self.last_used) as f64;
+        self.score * 0.5_f64.powf(elapsed / USAGE_HALF_LIFE_SECS)
+    }
+}
+
+// 组 ID -> 文件名 -> 使用记录。
+type UsageMap = BTreeMap<String, BTreeMap<String, ImageUsage>>;
+
+// 粘贴可能并发记录使用次数，串行化使用记录文件的读改写。
+static USAGE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug)]
 pub(crate) struct ImageLibraryService {
@@ -243,6 +268,9 @@ impl ImageLibraryService {
                     }
                 }
             }
+            self.update_usage_logged(|usage| {
+                usage.remove(&current.id);
+            });
             Ok(())
         })
     }
@@ -257,6 +285,12 @@ impl ImageLibraryService {
         fs::create_dir_all(&directory).map_err(|error| format!("读取图库组目录失败：{error}"))?;
         let entries =
             fs::read_dir(directory).map_err(|error| format!("读取图库图片列表失败：{error}"))?;
+        let usage = self.load_usage().unwrap_or_else(|error| {
+            tracing::warn!("{error}");
+            UsageMap::new()
+        });
+        let group_usage = usage.get(&group.id);
+        let now = unix_now();
         let mut images = entries
             .filter_map(Result::ok)
             .filter_map(|entry| {
@@ -279,6 +313,9 @@ impl ImageLibraryService {
                     .as_ref()
                     .and_then(|metadata| metadata.created().ok())
                     .unwrap_or(UNIX_EPOCH);
+                let usage_score = group_usage
+                    .and_then(|usage| usage.get(&name))
+                    .map_or(0.0, |usage| usage.score_at(now));
                 Some(ImageLibraryImage {
                     path,
                     name,
@@ -286,6 +323,7 @@ impl ImageLibraryService {
                     file_type,
                     modified_at,
                     created_at,
+                    usage_score,
                 })
             })
             .collect::<Vec<_>>();
@@ -338,6 +376,17 @@ impl ImageLibraryService {
         }
         fs::rename(&source, &destination)
             .map_err(|error| format!("重命名图库图片失败：{error}"))?;
+        if let (Some(old_name), Some(new_name)) = (source.file_name(), destination.file_name()) {
+            let old_name = old_name.to_string_lossy().into_owned();
+            let new_name = new_name.to_string_lossy().into_owned();
+            self.update_usage_logged(|usage| {
+                if let Some(group_usage) = usage.get_mut(&group.id)
+                    && let Some(entry) = group_usage.remove(&old_name)
+                {
+                    group_usage.insert(new_name, entry);
+                }
+            });
+        }
         Ok(destination)
     }
 
@@ -363,7 +412,21 @@ impl ImageLibraryService {
         if target_path.exists() {
             return Err("目标图库组中已存在同名图片".to_owned());
         }
-        fs::rename(&source_path, &target_path).map_err(|error| format!("移动图库图片失败：{error}"))
+        fs::rename(&source_path, &target_path)
+            .map_err(|error| format!("移动图库图片失败：{error}"))?;
+        let name = source_name.to_string_lossy().into_owned();
+        self.update_usage_logged(|usage| {
+            if let Some(entry) = usage
+                .get_mut(&source_group.id)
+                .and_then(|group_usage| group_usage.remove(&name))
+            {
+                usage
+                    .entry(target_group.id.clone())
+                    .or_default()
+                    .insert(name, entry);
+            }
+        });
+        Ok(())
     }
 
     pub(crate) fn delete_image(
@@ -377,7 +440,55 @@ impl ImageLibraryService {
             .file_name()
             .ok_or_else(|| "图片路径无效".to_owned())?;
         let source_path = self.group_directory(group)?.join(source_name);
-        fs::remove_file(&source_path).map_err(|error| format!("删除图库图片失败：{error}"))
+        fs::remove_file(&source_path).map_err(|error| format!("删除图库图片失败：{error}"))?;
+        let name = source_name.to_string_lossy().into_owned();
+        self.update_usage_logged(|usage| {
+            if let Some(group_usage) = usage.get_mut(&group.id) {
+                group_usage.remove(&name);
+            }
+        });
+        Ok(())
+    }
+
+    /// 记录一次图片使用（粘贴或复制），供“使用频率”排序。
+    pub(crate) fn record_image_use(&self, path: &Path) -> Result<(), String> {
+        let _operation =
+            crate::services::data_runtime::begin_operation().map_err(|error| error.to_string())?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| "图片路径无效".to_owned())?
+            .to_string_lossy()
+            .into_owned();
+        let groups = self.load_groups()?;
+        let group = groups
+            .iter()
+            .find(|group| {
+                self.group_directory(group)
+                    .is_ok_and(|directory| path.parent() == Some(directory.as_path()))
+            })
+            .ok_or_else(|| "图片不属于任何图库组".to_owned())?;
+        let now = unix_now();
+        self.update_usage(|usage| {
+            // 顺带清理已不存在的组和图片，防止手动删除文件后残留记录。
+            usage.retain(|group_id, group_usage| {
+                let Some(directory) = groups
+                    .iter()
+                    .find(|group| &group.id == group_id)
+                    .and_then(|group| self.group_directory(group).ok())
+                else {
+                    return false;
+                };
+                group_usage.retain(|name, _| directory.join(name).is_file());
+                !group_usage.is_empty()
+            });
+            let entry = usage
+                .entry(group.id.clone())
+                .or_default()
+                .entry(name)
+                .or_default();
+            entry.score = entry.score_at(now) + 1.0;
+            entry.last_used = now;
+        })
     }
 
     pub(crate) fn import_images_with_progress<F>(
@@ -611,6 +722,43 @@ impl ImageLibraryService {
             .map_err(|error| format!("保存图库组信息失败：{error}"))
     }
 
+    fn load_usage(&self) -> Result<UsageMap, String> {
+        match fs::read_to_string(self.root.join(USAGE_FILE_NAME)) {
+            Ok(content) => serde_json::from_str(&content)
+                .map_err(|error| format!("解析图库使用记录失败：{error}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(UsageMap::new()),
+            Err(error) => Err(format!("读取图库使用记录失败：{error}")),
+        }
+    }
+
+    fn update_usage(&self, update: impl FnOnce(&mut UsageMap)) -> Result<(), String> {
+        let _lock = USAGE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 记录损坏时从空记录重新开始，不影响图库本身的使用。
+        let mut usage = self.load_usage().unwrap_or_else(|error| {
+            tracing::warn!("{error}");
+            UsageMap::new()
+        });
+        update(&mut usage);
+        fs::create_dir_all(&self.root).map_err(|error| format!("创建图库目录失败：{error}"))?;
+        let content = serde_json::to_string(&usage)
+            .map_err(|error| format!("序列化图库使用记录失败：{error}"))?;
+        let mut file = AtomicWriteFile::open(self.root.join(USAGE_FILE_NAME))
+            .map_err(|error| format!("打开图库使用记录文件失败：{error}"))?;
+        file.write_all(content.as_bytes())
+            .map_err(|error| format!("写入图库使用记录失败：{error}"))?;
+        file.commit()
+            .map_err(|error| format!("保存图库使用记录失败：{error}"))
+    }
+
+    // 使用记录只影响排序，同步失败时不让图片操作本身失败。
+    fn update_usage_logged(&self, update: impl FnOnce(&mut UsageMap)) {
+        if let Err(error) = self.update_usage(update) {
+            tracing::warn!("同步图库使用记录失败：{error}");
+        }
+    }
+
     fn group_directory(&self, group: &ImageLibraryGroup) -> Result<PathBuf, String> {
         if uuid::Uuid::parse_str(&group.id).is_err() || !valid_group_name(&group.name) {
             return Err("图库组信息无效".to_owned());
@@ -623,10 +771,17 @@ impl ImageLibraryService {
     }
 }
 
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 fn valid_group_name(name: &str) -> bool {
     let name = name.trim();
     !name.is_empty()
         && !name.eq_ignore_ascii_case(GROUP_ICONS_DIRECTORY_NAME)
+        && !name.eq_ignore_ascii_case(USAGE_FILE_NAME)
         && name.len() <= 160
         && !name.ends_with('.')
         && !name.ends_with(' ')

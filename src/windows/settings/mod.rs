@@ -467,12 +467,30 @@ fn search_target_specs() -> &'static [SearchTargetSpec] {
             page: General,
             title_key: "settings.general.launch_at_login",
             description_key: Some("settings.general.launch_at_login_description"),
-            ratio: 0.50,
+            ratio: 0.20,
         },
         SearchTargetSpec {
             page: General,
             title_key: "settings.general.run_as_administrator",
             description_key: Some("settings.general.run_as_administrator_description"),
+            ratio: 0.40,
+        },
+        SearchTargetSpec {
+            page: General,
+            title_key: "settings.general.hide_tray_icon",
+            description_key: Some("settings.general.hide_tray_icon_description"),
+            ratio: 0.60,
+        },
+        SearchTargetSpec {
+            page: General,
+            title_key: "settings.general.tray_left_click",
+            description_key: None,
+            ratio: 0.80,
+        },
+        SearchTargetSpec {
+            page: General,
+            title_key: "settings.general.tray_right_click",
+            description_key: None,
             ratio: 0.98,
         },
         SearchTargetSpec {

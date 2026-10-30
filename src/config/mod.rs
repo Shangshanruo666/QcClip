@@ -199,6 +199,9 @@ pub struct GeneralConfig {
     pub notifications: NotificationConfig,
     pub launch_at_login: bool,
     pub run_as_administrator: bool,
+    pub hide_tray_icon: bool,
+    pub tray_left_click_action: TrayClickAction,
+    pub tray_right_click_action: TrayClickAction,
 }
 
 impl Default for GeneralConfig {
@@ -209,6 +212,61 @@ impl Default for GeneralConfig {
             notifications: NotificationConfig::default(),
             launch_at_login: false,
             run_as_administrator: false,
+            hide_tray_icon: false,
+            tray_left_click_action: TrayClickAction::ToggleMainWindow,
+            tray_right_click_action: TrayClickAction::OpenMenu,
+        }
+    }
+}
+
+/// 点击托盘图标时执行的行为，左键与右键共用同一组选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrayClickAction {
+    None,
+    ToggleMainWindow,
+    OpenMenu,
+    OpenSettings,
+    OpenClipboard,
+    OpenFavorites,
+    OpenEmoji,
+    OpenSymbols,
+    OpenGallery,
+    ToggleClipboardMonitor,
+    ToggleGlobalHotkeys,
+    ToggleFormattedPaste,
+}
+
+impl TrayClickAction {
+    pub const ALL: [Self; 12] = [
+        Self::None,
+        Self::ToggleMainWindow,
+        Self::OpenMenu,
+        Self::OpenSettings,
+        Self::OpenClipboard,
+        Self::OpenFavorites,
+        Self::OpenEmoji,
+        Self::OpenSymbols,
+        Self::OpenGallery,
+        Self::ToggleClipboardMonitor,
+        Self::ToggleGlobalHotkeys,
+        Self::ToggleFormattedPaste,
+    ];
+
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ToggleMainWindow => "toggle-main-window",
+            Self::OpenMenu => "open-menu",
+            Self::OpenSettings => "open-settings",
+            Self::OpenClipboard => "open-clipboard",
+            Self::OpenFavorites => "open-favorites",
+            Self::OpenEmoji => "open-emoji",
+            Self::OpenSymbols => "open-symbols",
+            Self::OpenGallery => "open-gallery",
+            Self::ToggleClipboardMonitor => "toggle-clipboard-monitor",
+            Self::ToggleGlobalHotkeys => "toggle-global-hotkeys",
+            Self::ToggleFormattedPaste => "toggle-formatted-paste",
         }
     }
 }

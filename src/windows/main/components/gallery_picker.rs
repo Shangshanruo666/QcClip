@@ -830,6 +830,11 @@ fn sort_gallery_images(images: &mut [ImageLibraryImage], sort: PersistedGalleryS
                 .cmp(&right.created_at)
                 .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
                 .then_with(|| left.name.cmp(&right.name)),
+            GallerySortField::UsageFrequency => left
+                .usage_score
+                .total_cmp(&right.usage_score)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+                .then_with(|| left.name.cmp(&right.name)),
         };
         if sort.order == GallerySortOrder::Descending {
             comparison.reverse()
@@ -1332,6 +1337,11 @@ fn render_gallery_sort_button(
             translator.translate("main.gallery.sort.created_date"),
         )
         .selected(sort.field == GallerySortField::CreatedDate),
+        DropdownItem::option(
+            DropdownItemId::new("field:usage"),
+            translator.translate("main.gallery.sort.usage_frequency"),
+        )
+        .selected(sort.field == GallerySortField::UsageFrequency),
         DropdownItem::separator(),
         DropdownItem::option(
             DropdownItemId::new("order:ascending"),
@@ -1392,6 +1402,7 @@ fn render_gallery_sort_button(
                             "field:type" => sort.field = GallerySortField::Type,
                             "field:modified" => sort.field = GallerySortField::ModifiedDate,
                             "field:created" => sort.field = GallerySortField::CreatedDate,
+                            "field:usage" => sort.field = GallerySortField::UsageFrequency,
                             "order:ascending" => sort.order = GallerySortOrder::Ascending,
                             "order:descending" => sort.order = GallerySortOrder::Descending,
                             _ => return,
@@ -1680,6 +1691,7 @@ mod tests {
             file_type: "gif".to_owned(),
             modified_at: std::time::UNIX_EPOCH,
             created_at: std::time::UNIX_EPOCH,
+            usage_score: 0.0,
         }
     }
 

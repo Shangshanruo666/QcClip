@@ -14,7 +14,8 @@ use crate::{
         AnimationKind, AppConfig, AppearanceConfig, ApplicationFilterConfig, ClipboardConfig,
         HistoryConfig, InterfaceLanguage, NotificationConfig, NotificationKind,
         NotificationPosition, PreviewInformationConfig, QuickPasteConfig, ShortcutBinding,
-        ShortcutsConfig, SoundConfig, WindowMaterial, default_window_material_opacity,
+        ShortcutsConfig, SoundConfig, TrayClickAction, WindowMaterial,
+        default_window_material_opacity,
     },
     i18n::{self, Locale},
 };
@@ -135,6 +136,9 @@ impl ConfigRuntime {
             {
                 tracing::error!("同步开机自启设置失败：{error}");
             }
+        }
+        if previous.general.hide_tray_icon != config.general.hide_tray_icon {
+            crate::services::tray::TrayService::sync_visibility(cx);
         }
         if previous.shortcuts != config.shortcuts {
             crate::windows::quick_paste::QuickPasteWindowService::cancel(cx);
@@ -496,6 +500,62 @@ pub(crate) fn set_run_as_administrator(enabled: bool, cx: &mut App) -> Result<bo
     Ok(true)
 }
 
+pub(crate) fn hide_tray_icon(cx: &App) -> bool {
+    cx.read_global::<ConfigRuntime, _>(|runtime, _| runtime.config.general.hide_tray_icon)
+}
+
+pub(crate) fn tray_click_actions(cx: &App) -> (TrayClickAction, TrayClickAction) {
+    cx.read_global::<ConfigRuntime, _>(|runtime, _| {
+        (
+            runtime.config.general.tray_left_click_action,
+            runtime.config.general.tray_right_click_action,
+        )
+    })
+}
+
+pub(crate) fn set_hide_tray_icon(hidden: bool, cx: &mut App) -> Result<bool, ConfigError> {
+    let (current, path, mut next) = cx.read_global::<ConfigRuntime, _>(|runtime, _| {
+        (
+            runtime.config.general.hide_tray_icon,
+            runtime.path.clone(),
+            runtime.config.clone(),
+        )
+    });
+    if current == hidden {
+        return Ok(false);
+    }
+
+    next.general.hide_tray_icon = hidden;
+    persist_config(&path, &next)?;
+    cx.update_global::<ConfigRuntime, _>(|runtime, _| runtime.config = next);
+    crate::services::tray::TrayService::sync_visibility(cx);
+    Ok(true)
+}
+
+/// `right` 为 true 时保存右键行为，否则保存左键行为。
+pub(crate) fn set_tray_click_action(
+    right: bool,
+    action: TrayClickAction,
+    cx: &mut App,
+) -> Result<bool, ConfigError> {
+    let (path, mut next) = cx.read_global::<ConfigRuntime, _>(|runtime, _| {
+        (runtime.path.clone(), runtime.config.clone())
+    });
+    let target = if right {
+        &mut next.general.tray_right_click_action
+    } else {
+        &mut next.general.tray_left_click_action
+    };
+    if *target == action {
+        return Ok(false);
+    }
+
+    *target = action;
+    persist_config(&path, &next)?;
+    cx.update_global::<ConfigRuntime, _>(|runtime, _| runtime.config = next);
+    Ok(true)
+}
+
 pub(crate) fn reset_general_config(cx: &mut App) -> Result<bool, ConfigError> {
     let (path, current, mut next) = cx.read_global::<ConfigRuntime, _>(|runtime, _| {
         (
@@ -516,6 +576,7 @@ pub(crate) fn reset_general_config(cx: &mut App) -> Result<bool, ConfigError> {
             .map_err(|source| ConfigError::System { source })?;
     }
     let language = default.language;
+    let hide_tray_icon = default.hide_tray_icon;
     next.general = default;
     if let Err(error) = persist_config(&path, &next) {
         if current.launch_at_login != next.general.launch_at_login {
@@ -535,6 +596,9 @@ pub(crate) fn reset_general_config(cx: &mut App) -> Result<bool, ConfigError> {
         runtime.config = next;
     });
     i18n::set_locale(Locale::new(language.code()), cx);
+    if current.hide_tray_icon != hide_tray_icon {
+        crate::services::tray::TrayService::sync_visibility(cx);
+    }
     cx.refresh_windows();
     Ok(true)
 }

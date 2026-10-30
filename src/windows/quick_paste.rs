@@ -28,6 +28,20 @@ const QUICK_PASTE_MAX_VISIBLE_ROWS: usize = 15;
 const QUICK_PASTE_PREFETCH_ROWS: usize = 30;
 const QUICK_PASTE_REVEAL_DURATION: Duration = Duration::from_millis(250);
 const QUICK_PASTE_HIDE_DURATION: Duration = Duration::from_millis(100);
+
+/// 卡片阴影的模糊半径。
+const QUICK_PASTE_SHADOW_BLUR: f32 = 3.0;
+/// 为阴影在窗口边缘预留的空间，避免被窗口裁剪；需不小于阴影模糊半径。
+const QUICK_PASTE_SHADOW_MARGIN: f32 = QUICK_PASTE_SHADOW_BLUR + 1.0;
+
+/// 偏移为 0 的阴影，使四周阴影均匀。
+fn quick_paste_shadow(alpha: f32, blur: f32) -> Vec<gpui::BoxShadow> {
+    vec![
+        gpui::BoxShadow::new(px(0.0), px(0.0), gpui::hsla(0.0, 0.0, 0.0, alpha))
+            .blur_radius(px(blur))
+            .spread_radius(px(0.0)),
+    ]
+}
 const QUICK_PASTE_REVEAL_FRAME: Duration = Duration::from_millis(16);
 
 #[derive(Default)]
@@ -96,17 +110,19 @@ impl QuickPasteWindowService {
             blob_store,
             clipboard_write_suppressor,
         );
-        cx.update_global::<Self, _>(|service, cx| {
+        // 关闭窗口会同步触发 on_window_closed 回调并再次访问本全局，必须在 update_global 之外执行。
+        let window = cx.update_global::<Self, _>(|service, _| {
             service.active = false;
             service.closing = false;
-            service.window.take().inspect(|window| {
-                let _ = window.update(cx, |_, window, _| window.remove_window());
-            });
             service.history_repository = Some(history_repository);
             service.favorite_repository = Some(favorite_repository);
             service.paste_service = Some(paste_service);
             service.image_preview_service = Some(image_preview_service);
+            service.window.take()
         });
+        if let Some(window) = window {
+            let _ = window.update(cx, |_, window, _| window.remove_window());
+        }
     }
 
     pub(crate) fn show(cx: &mut App) {
@@ -470,13 +486,15 @@ impl QuickPasteWindowService {
 
     pub(crate) fn cancel(cx: &mut App) {
         crate::hotkey::deactivate_quick_paste_navigation(cx);
-        cx.update_global::<Self, _>(|service, cx| {
+        // 关闭窗口会同步触发 on_window_closed 回调并再次访问本全局，必须在 update_global 之外执行。
+        let window = cx.update_global::<Self, _>(|service, _| {
             service.active = false;
             service.closing = false;
-            if let Some(window) = service.window.take() {
-                let _ = window.update(cx, |_, window, _| window.remove_window());
-            }
+            service.window.take()
         });
+        if let Some(window) = window {
+            let _ = window.update(cx, |_, window, _| window.remove_window());
+        }
     }
 
     pub(crate) fn navigate(navigation: crate::hotkey::QuickPasteNavigation, cx: &mut App) {
@@ -623,7 +641,9 @@ impl QuickPasteWindowView {
             let bounds = window.bounds();
             self.width = self.configured_width;
             self.visible_rows = desired_row_count;
-            let logical_height = self.tab_height + f32::from(row_height) * desired_row_count as f32;
+            let logical_height = self.tab_height
+                + f32::from(row_height) * desired_row_count as f32
+                + QUICK_PASTE_SHADOW_MARGIN;
             self.reveal_center = point(px(self.width / 2.0), px(logical_height / 2.0));
             if !popup.resize_to_physical_bounds(
                 window,
@@ -790,8 +810,9 @@ impl QuickPasteWindowView {
             return None;
         }
 
-        let total_height =
-            self.tab_height + f32::from(self.row_height) * self.visible_row_count().max(1) as f32;
+        let total_height = self.tab_height
+            + f32::from(self.row_height) * self.visible_row_count().max(1) as f32
+            + QUICK_PASTE_SHADOW_MARGIN;
         let center_x = f32::from(self.reveal_center.x);
         let center_y = f32::from(self.reveal_center.y);
         let radius = center_x
@@ -911,8 +932,10 @@ impl QuickPasteWindowView {
             .map(|display| display.scale_factor)
             .unwrap_or_else(|| window.scale_factor())
             .max(1.0);
-        let physical_height =
-            (self.tab_height + f32::from(self.row_height) * row_count as f32) * scale;
+        let physical_height = (self.tab_height
+            + f32::from(self.row_height) * row_count as f32
+            + QUICK_PASTE_SHADOW_MARGIN)
+            * scale;
         let physical_width = self.width * scale;
         let bounds = self.display.map(|display| display.bounds);
         let margin = 8.0 * scale;
@@ -1327,10 +1350,11 @@ impl QuickPasteWindowView {
             }))
             .child(
                 div()
+                    // 左右预留阴影空间，选中项的阴影不会被窗口裁剪。
                     .w(px(if selected {
-                        self.width
+                        self.width - QUICK_PASTE_SHADOW_MARGIN * 2.0
                     } else {
-                        self.width * 0.92
+                        (self.width * 0.92).min(self.width - QUICK_PASTE_SHADOW_MARGIN * 2.0)
                     }))
                     .h(self.content_height)
                     .flex()
@@ -1344,6 +1368,7 @@ impl QuickPasteWindowView {
                     .border_color(border)
                     .bg(background)
                     .text_color(text_color)
+                    .shadow(quick_paste_shadow(0.32, QUICK_PASTE_SHADOW_BLUR))
                     .pl(px(if has_status { 24.0 } else { 14.0 }))
                     .pr(px(14.0))
                     .when_some(
@@ -1446,6 +1471,7 @@ impl QuickPasteWindowView {
                     .border_color(theme.border)
                     .bg(theme.background)
                     .p(px(2.0))
+                    .shadow(quick_paste_shadow(0.32, QUICK_PASTE_SHADOW_BLUR))
                     .child(
                         div()
                             .id("quick-paste-source-clipboard")
@@ -1460,6 +1486,9 @@ impl QuickPasteWindowView {
                                 theme.primary
                             } else {
                                 theme.background
+                            })
+                            .when(clipboard_selected, |tab| {
+                                tab.shadow(quick_paste_shadow(0.30, 2.0))
                             })
                             .text_color(if clipboard_selected {
                                 theme.primary_foreground
@@ -1486,6 +1515,9 @@ impl QuickPasteWindowView {
                                 theme.primary
                             } else {
                                 theme.background
+                            })
+                            .when(favorites_selected, |tab| {
+                                tab.shadow(quick_paste_shadow(0.30, 2.0))
                             })
                             .text_color(if favorites_selected {
                                 theme.primary_foreground
@@ -1549,7 +1581,8 @@ impl Render for QuickPasteWindowView {
         }
         let start = self.visible_start();
         let list_height = f32::from(self.row_height) * self.visible_row_count().max(1) as f32;
-        let total_height = self.tab_height + list_height;
+        // 底部预留阴影空间，最后一行卡片的阴影不会被窗口裁剪。
+        let total_height = self.tab_height + list_height + QUICK_PASTE_SHADOW_MARGIN;
         let list_content = if self.list_ids.is_empty() {
             let translator = crate::i18n::translator(cx);
             let theme = crate::window_material::excluded_window_theme(cx);
